@@ -1,7 +1,7 @@
 {
-  "defaultRegistry": "elizaos/registry",
+  "defaultRegistry": "elizaos-plugins/registry",
   "publishConfig": {
-    "registry": "elizaos/registry",
+    "registry": "elizaos-plugins/registry",
     "username": "monilpat",
     "useNpm": false,
     "platform": "universal"

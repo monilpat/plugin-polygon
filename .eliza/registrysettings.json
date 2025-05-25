@@ -1,0 +1,9 @@
+{
+  "defaultRegistry": "elizaos/registry",
+  "publishConfig": {
+    "registry": "elizaos/registry",
+    "username": "monilpat",
+    "useNpm": false,
+    "platform": "universal"
+  }
+}

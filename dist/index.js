@@ -1,8 +1,8 @@
 // src/index.ts
 import {
-  logger as logger21
+  logger as logger19
 } from "@elizaos/core";
-import { z as z5 } from "zod";
+import { z as z3 } from "zod";
 import { ethers as ethers5 } from "ethers";
 
 // src/actions/transfer.ts
@@ -3148,7 +3148,7 @@ var _PolygonRpcService = class _PolygonRpcService extends Service {
    */
   async undelegate(validatorId, sharesAmountWei) {
     logger2.info(
-      `Initiating undelegation of ${sharesAmountWei} shares from validator ${validatorId} on L1...`
+      `Initiating undelegation of approximately ${sharesAmountWei} shares from validator ${validatorId} on L1...`
     );
     if (sharesAmountWei <= 0n) {
       throw new Error("Undelegation shares amount must be greater than zero.");
@@ -3160,7 +3160,15 @@ var _PolygonRpcService = class _PolygonRpcService extends Service {
       if (!contract.interface.getFunction("sellVoucher(uint256,uint256)")) {
         throw new Error("ValidatorShare contract does not expose sellVoucher(uint256,uint256)");
       }
-      const txData = await contract.sellVoucher.populateTransaction(sharesAmountWei, 0n);
+      const buffer = sharesAmountWei / 1000n;
+      const maxSharesToBurn = sharesAmountWei + buffer + 1n;
+      logger2.debug(
+        `Calculated shares: ${sharesAmountWei}, Max shares to burn (with buffer): ${maxSharesToBurn}`
+      );
+      const txData = await contract["sellVoucher(uint256,uint256)"].populateTransaction(
+        sharesAmountWei,
+        maxSharesToBurn
+      );
       const gasLimit = await signer.estimateGas({ ...txData });
       const gasLimitBuffered = gasLimit * 120n / 100n;
       const { maxFeePerGas, maxPriorityFeePerGas } = await this._getL1FeeDetails();
@@ -3172,6 +3180,8 @@ var _PolygonRpcService = class _PolygonRpcService extends Service {
         maxPriorityFeePerGas,
         chainId: (await l1Provider.getNetwork()).chainId
       };
+      const nonce = await signer.getNonce();
+      tx.nonce = nonce;
       logger2.debug("Signing undelegation transaction...", tx);
       const signedTx = await signer.signTransaction(tx);
       logger2.info(`Broadcasting L1 undelegation transaction for validator ${validatorId}...`);
@@ -3182,6 +3192,41 @@ var _PolygonRpcService = class _PolygonRpcService extends Service {
       logger2.error(`Undelegation from validator ${validatorId} failed:`, error);
       const errorMessage = error instanceof Error ? error.message : String(error);
       throw new Error(`Undelegation failed: ${errorMessage}`);
+    }
+  }
+  /**
+   * Converts MATIC amount to validator shares using the exchange rate.
+   * @param validatorId The ID of the validator.
+   * @param maticAmountWei The amount of MATIC in Wei to convert.
+   * @returns The equivalent amount in validator shares.
+   */
+  async convertMaticToShares(validatorId, maticAmountWei) {
+    logger2.debug(
+      `Converting ${maticAmountWei} Wei MATIC to shares for validator ${validatorId}...`
+    );
+    if (maticAmountWei <= 0n) {
+      throw new Error("MATIC amount must be greater than zero.");
+    }
+    try {
+      const validatorShareContract = await this._getValidatorShareContract(validatorId);
+      if (!validatorShareContract.interface.getFunction("exchangeRate()")) {
+        throw new Error("ValidatorShare contract does not expose exchangeRate()");
+      }
+      const exchangeRate = await validatorShareContract.exchangeRate();
+      if (exchangeRate <= 0n) {
+        throw new Error("Invalid exchange rate received from ValidatorShare contract");
+      }
+      const validatorIdBigInt = BigInt(validatorId);
+      const precision = validatorIdBigInt < 8n ? 100n : 10n ** 29n;
+      const sharesAmount = maticAmountWei * precision / exchangeRate;
+      logger2.debug(
+        `Validator ID: ${validatorId}, Precision: ${precision}, Exchange rate: ${exchangeRate}, Calculated ${maticAmountWei} Wei MATIC to ${sharesAmount} shares`
+      );
+      return sharesAmount;
+    } catch (error) {
+      logger2.error(`Failed to convert MATIC to shares for validator ${validatorId}:`, error);
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      throw new Error(`MATIC to shares conversion failed: ${errorMessage}`);
     }
   }
   /**
@@ -3210,6 +3255,8 @@ var _PolygonRpcService = class _PolygonRpcService extends Service {
         maxPriorityFeePerGas,
         chainId: (await l1Provider.getNetwork()).chainId
       };
+      const nonce = await signer.getNonce();
+      tx.nonce = nonce;
       logger2.debug("Signing reward withdrawal transaction...", tx);
       const signedTx = await signer.signTransaction(tx);
       logger2.info(`Broadcasting L1 reward withdrawal transaction for validator ${validatorId}...`);
@@ -3692,30 +3739,30 @@ If no valid validator ID or amount is found, or if the user's intent is unclear,
 }
 \`\`\`
 `;
-var undelegateL1Template = `You are an AI assistant. Your task is to extract the validator ID and the amount of shares to undelegate from the user's message.
+var undelegateL1Template = `You are an AI assistant. Your task is to extract the validator ID and the amount of MATIC to undelegate from the user's message.
 The validator ID must be a positive integer.
-The shares amount must be a positive number, representing the amount of validator shares in the smallest unit (Wei) as a string.
+The amount should be treated as MATIC tokens (e.g., "0.1", "0.5 MATIC", "2.5 matic") and will be converted to validator shares automatically.
 
 Review the recent messages:
 <recent_messages>
 {{recentMessages}}
 </recent_messages>
 
-Based on the conversation, identify the validator ID and the amount of shares to undelegate.
+Based on the conversation, identify the validator ID and the MATIC amount to undelegate.
 
 Respond with a JSON markdown block containing only the extracted values.
 The JSON should have this structure:
 \`\`\`json
 {
     "validatorId": number,
-    "sharesAmountWei": string
+    "maticAmount": string
 }
 \`\`\`
 
-If no valid validator ID or shares amount is found, or if the user's intent is unclear, you MUST respond with the following JSON structure:
+If no valid validator ID or amount is found, or if the user's intent is unclear, you MUST respond with the following JSON structure:
 \`\`\`json
 {
-    "error": "Validator ID or shares amount not found or invalid. Please specify a positive integer for the validator ID and a positive amount of shares in Wei (as a string)."
+    "error": "Validator ID or MATIC amount not found or invalid. Please specify a positive integer for the validator ID and a positive MATIC amount (e.g., '0.5' or '0.5 MATIC')."
 }
 \`\`\`
 `;
@@ -3823,183 +3870,6 @@ Example valid tokens:
 - Arbitrum WETH: 0x82aF49447D8a07e3bd95BD0d56f35241523fBab1
 
 Always use the appropriate token address for the specified chains.`;
-var proposeGovernanceActionTemplate = `You are an AI assistant. Your task is to extract parameters for submitting a new governance proposal.
-
-Review the recent messages:
-<recent_messages>
-{{recentMessages}}
-</recent_messages>
-
-Based on the conversation, identify:
-- chain: The blockchain name (e.g., "polygon").
-- governorAddress: The address of the Governor contract.
-- targets: An array of target contract addresses.
-- values: An array of ETH values (strings) for each action.
-- calldatas: An array of hex-encoded calldata for each action.
-- description: The full text description of the proposal.
-
-Respond with a JSON markdown block containing only the extracted values.
-The JSON should have this structure:
-\`\`\`json
-{
-    "chain": "string",
-    "governorAddress": "0xstring",
-    "targets": ["0xstring"],
-    "values": ["string"],
-    "calldatas": ["0xstring"],
-    "description": "string"
-}
-\`\`\`
-
-If any required parameters are missing or unclear, you MUST respond with the following JSON structure:
-\`\`\`json
-{
-    "error": "Could not determine all required governance proposal parameters (chain, governorAddress, targets, values, calldatas, description). Please clarify your request."
-}
-\`\`\`
-`;
-var voteGovernanceActionTemplate = `You are an AI assistant. Your task is to extract parameters for voting on a governance proposal.
-
-Review the recent messages:
-<recent_messages>
-{{recentMessages}}
-</recent_messages>
-
-Based on the conversation, identify:
-- chain: The blockchain name (e.g., "polygon").
-- governorAddress: The address of the Governor contract.
-- proposalId: The ID of the proposal to vote on.
-- support: The vote option (0 for Against, 1 for For, 2 for Abstain).
-- reason (optional): The reason for the vote.
-
-Respond with a JSON markdown block containing only the extracted values.
-The JSON should have this structure:
-\`\`\`json
-{
-    "chain": "string",
-    "governorAddress": "0xstring",
-    "proposalId": "string",
-    "support": number,
-    "reason"?: "string"
-}
-\`\`\`
-
-If any required parameters (chain, governorAddress, proposalId, support) are missing or unclear, you MUST respond with the following JSON structure:
-\`\`\`json
-{
-    "error": "Could not determine all required voting parameters (chain, governorAddress, proposalId, support). Please clarify your request."
-}
-\`\`\`
-`;
-var heimdallVoteActionTemplate = `You are an AI assistant. Your task is to extract parameters for voting on a Heimdall governance proposal.
-
-Review the recent messages:
-<recent_messages>
-{{recentMessages}}
-</recent_messages>
-
-Based on the conversation, identify:
-- proposalId: The ID of the Heimdall proposal (string or number).
-- option: The vote option (numeric value like 0, 1, 2, 3, 4, or string like YES, NO, ABSTAIN).
-
-Respond with a JSON markdown block containing only the extracted values.
-The JSON should have this structure:
-\`\`\`json
-{
-    "proposalId": "string | number",
-    "option": "number | string"
-}
-\`\`\`
-
-If any required parameters (proposalId, option) are missing or unclear, you MUST respond with the following JSON structure:
-\`\`\`json
-{
-    "error": "Could not determine all required Heimdall voting parameters (proposalId, option). Please clarify your request."
-}
-\`\`\`
-`;
-var heimdallSubmitProposalActionTemplate = `You are an AI assistant. Your task is to extract parameters for submitting a new governance proposal (Text or ParameterChange) to Heimdall.
-
-Review the recent messages:
-<recent_messages>
-{{recentMessages}}
-</recent_messages>
-
-Based on the conversation, identify:
-- content: An object representing the proposal content. It must have a "type" field ("TextProposal" or "ParameterChangeProposal").
-  - For TextProposal: "title" (string), "description" (string).
-  - For ParameterChangeProposal: "title" (string), "description" (string), "changes" (array of {subspace: string, key: string, value: string}).
-- initialDepositAmount: The amount of the initial deposit for the proposal (string, e.g., "10000000").
-- initialDepositDenom (optional): The denomination of the initial deposit (default: "matic").
-
-Respond with a JSON markdown block containing only the extracted values.
-The JSON should have this structure:
-\`\`\`json
-{
-    "content": {
-        "type": "TextProposal" | "ParameterChangeProposal",
-        "title": "string",
-        "description": "string",
-        "changes": [{ "subspace": "string", "key": "string", "value": "string" }] // Only for ParameterChangeProposal
-    },
-    "initialDepositAmount": "string",
-    "initialDepositDenom": "string" // e.g., "matic"
-}
-\`\`\`
-
-Example for TextProposal content:
-{
-    "type": "TextProposal",
-    "title": "Network Upgrade Info",
-    "description": "Details about upcoming v2 upgrade."
-}
-
-Example for ParameterChangeProposal content:
-{
-    "type": "ParameterChangeProposal",
-    "title": "Update Staking Param",
-    "description": "Increase max validators",
-    "changes": [
-        { "subspace": "staking", "key": "MaxValidators", "value": "120" }
-    ]
-}
-
-If any required parameters are missing or unclear, you MUST respond with the following JSON structure:
-\`\`\`json
-{
-    "error": "Could not determine all required Heimdall proposal parameters (content type, title, description, initialDepositAmount, and changes if ParameterChangeProposal). Please clarify your request."
-}
-\`\`\`
-`;
-var heimdallTransferTokensActionTemplate = `You are an AI assistant. Your task is to extract parameters for transferring native tokens on the Heimdall network.
-
-Review the recent messages:
-<recent_messages>
-{{recentMessages}}
-</recent_messages>
-
-Based on the conversation, identify:
-- recipientAddress: The Heimdall address of the recipient (must start with "heimdall" or "heimdallvaloper").
-- amount: The amount of tokens to transfer in Wei (string of digits, e.g., "1000000000000000000").
-- denom (optional): The denomination of the tokens (default: "matic").
-
-Respond with a JSON markdown block containing only the extracted values.
-The JSON should have this structure:
-\`\`\`json
-{
-    "recipientAddress": "string",
-    "amount": "string",
-    "denom": "string" // e.g., "matic" or "uatom"
-}
-\`\`\`
-
-If any required parameters (recipientAddress, amount) are missing or unclear, you MUST respond with the following JSON structure:
-\`\`\`json
-{
-    "error": "Could not determine all required Heimdall transfer parameters (recipientAddress, amount). Please clarify your request."
-}
-\`\`\`
-`;
 var getCheckpointStatusTemplate = `You are an AI assistant. Your task is to extract the block number from the user's message to check its checkpoint status.
 The block number must be a positive integer.
 
@@ -4447,564 +4317,11 @@ var getCheckpointStatusAction = {
   ]
 };
 
-// src/actions/proposeGovernance.ts
-import {
-  logger as logger5,
-  composePromptFromState as composePromptFromState4,
-  ModelType as ModelType4,
-  parseJSONObjectFromText as parseJSONObjectFromText3
-} from "@elizaos/core";
-import {
-  encodeFunctionData,
-  parseUnits as parseUnits3
-} from "viem";
-var governorProposeAbi = [
-  {
-    inputs: [
-      { name: "targets", type: "address[]" },
-      { name: "values", type: "uint256[]" },
-      { name: "calldatas", type: "bytes[]" },
-      { name: "description", type: "string" }
-    ],
-    name: "propose",
-    outputs: [{ name: "proposalId", type: "uint256" }],
-    stateMutability: "nonpayable",
-    // or 'payable' if it can receive value
-    type: "function"
-  }
-];
-function extractProposeGovernanceParamsFromText(text) {
-  const params = {};
-  logger5.debug(`Attempting to extract ProposeGovernanceParams from text: "${text}"`);
-  const chainMatch = text.match(/\b(?:on\s+|chain\s*[:\-]?\s*)(\w+)/i);
-  if (chainMatch?.[1]) params.chain = chainMatch[1].toLowerCase();
-  const governorMatch = text.match(/\b(?:governor\s*(?:address\s*)?[:\-]?\s*)(0x[a-fA-F0-9]{40})/i);
-  if (governorMatch?.[1]) params.governorAddress = governorMatch[1];
-  const targetsRgx = /\btargets?\s*[:\-]?\s*\[?((?:0x[a-fA-F0-9]{40}(?:\s*,\s*|\s+)?)+)\]?/i;
-  const targetsMatch = text.match(targetsRgx);
-  if (targetsMatch?.[1]) {
-    params.targets = targetsMatch[1].split(/[\s,]+/).filter((t) => /^0x[a-fA-F0-9]{40}$/.test(t));
-  }
-  const valuesRgx = /\bvalues?\s*[:\-]?\s*\[?((?:\d+(?:\.\d+)?(?:\s*,\s*|\s+)?)+)\]?/i;
-  const valuesMatch = text.match(valuesRgx);
-  if (valuesMatch?.[1]) {
-    params.values = valuesMatch[1].split(/[\s,]+/).filter((v) => /^\d+(?:\.\d+)?$/.test(v));
-  }
-  const calldatasRgx = /\bcalldatas?\s*[:\-]?\s*\[?((?:0x[a-fA-F0-9]+(?:\s*,\s*|\s+)?)+)\]?/i;
-  const calldatasMatch = text.match(calldatasRgx);
-  if (calldatasMatch?.[1]) {
-    params.calldatas = calldatasMatch[1].split(/[\s,]+/).filter((c) => /^0x[a-fA-F0-9]+$/.test(c));
-  }
-  const descriptionMatch = text.match(
-    /\b(?:desc(?:ription)?\s*[:\-]?\s*)(?:(?:['"""](.+?)['"'"])|(.*?)(?:\s*\b(?:chain|governor|targets|values|calldatas)\b|$))/i
-  );
-  if (descriptionMatch) {
-    params.description = (descriptionMatch[1] || descriptionMatch[2])?.trim();
-  }
-  logger5.debug("Manually extracted ProposeGovernanceParams:", params);
-  return params;
-}
-var PolygonProposeGovernanceActionRunner = class {
-  constructor(walletProvider) {
-    this.walletProvider = walletProvider;
-  }
-  // Use imported WalletProvider
-  async propose(params) {
-    const walletClient = this.walletProvider.getWalletClient(params.chain);
-    const publicClient = this.walletProvider.getPublicClient(params.chain);
-    const chainConfig = this.walletProvider.getChainConfigs(params.chain);
-    if (!walletClient.account) {
-      throw new Error("Wallet client account is not available.");
-    }
-    const senderAddress = walletClient.account.address;
-    const processedValues = params.values.map((valueStr) => {
-      const lowerValueStr = valueStr.toLowerCase();
-      const decimals = 18;
-      if (lowerValueStr.includes("eth") || lowerValueStr.includes("matic")) {
-        const numericPart = valueStr.replace(/\\s*(eth|matic)/i, "").trim();
-        try {
-          return parseUnits3(numericPart, decimals).toString();
-        } catch (e) {
-          logger5.warn(
-            `Could not parse value "${valueStr}" with parseUnits. Attempting direct BigInt conversion of numeric part "${numericPart}".`
-          );
-          return numericPart;
-        }
-      }
-      return valueStr;
-    });
-    const numericValues = processedValues.map((v) => {
-      try {
-        return BigInt(v);
-      } catch (e) {
-        logger5.error(
-          `Failed to convert processed value "${v}" to BigInt. Original param values: ${JSON.stringify(params.values)}`
-        );
-        throw new Error(
-          `Invalid numeric value for transaction: "${v}". Expected a number string convertible to BigInt (wei).`
-        );
-      }
-    });
-    const txData = encodeFunctionData({
-      abi: governorProposeAbi,
-      functionName: "propose",
-      args: [params.targets, numericValues, params.calldatas, params.description]
-    });
-    try {
-      logger5.debug(
-        `Proposing on ${params.chain} to ${params.governorAddress} with description "${params.description}"`
-      );
-      const kzg = {
-        blobToKzgCommitment: (_blob) => {
-          throw new Error("KZG not impl.");
-        },
-        computeBlobKzgProof: (_blob, _commit) => {
-          throw new Error("KZG not impl.");
-        }
-      };
-      const hash = await walletClient.sendTransaction({
-        account: senderAddress,
-        to: params.governorAddress,
-        value: BigInt(0),
-        data: txData,
-        chain: chainConfig,
-        kzg
-      });
-      logger5.info(`Proposal transaction sent. Hash: ${hash}. Waiting for receipt...`);
-      const receipt = await publicClient.waitForTransactionReceipt({ hash });
-      logger5.debug("Transaction receipt:", receipt);
-      let proposalId;
-      const proposalCreatedEventAbi = governorProposeAbi.find((item) => item.name === "propose");
-      return {
-        hash,
-        from: senderAddress,
-        to: params.governorAddress,
-        value: BigInt(0),
-        data: txData,
-        chainId: chainConfig.id,
-        logs: receipt.logs,
-        proposalId
-      };
-    } catch (error) {
-      const errMsg = error instanceof Error ? error.message : String(error);
-      logger5.error(`Governance proposal failed: ${errMsg}`, error);
-      throw new Error(`Governance proposal failed: ${errMsg}`);
-    }
-  }
-};
-var proposeGovernanceAction = {
-  name: "PROPOSE_GOVERNANCE_POLYGON",
-  similes: ["CREATE_POLYGON_PROPOSAL", "SUBMIT_POLYGON_GOVERNANCE_ACTION"],
-  description: "Submits a new governance proposal using the Polygon WalletProvider.",
-  validate: async (runtime, _message, _state) => {
-    logger5.debug("Validating PROPOSE_GOVERNANCE_POLYGON action...");
-    const checks = [
-      runtime.getSetting("WALLET_PRIVATE_KEY"),
-      runtime.getSetting("POLYGON_PLUGINS_ENABLED")
-    ];
-    if (checks.some((check) => !check)) {
-      logger5.error(
-        "Required settings (WALLET_PRIVATE_KEY, POLYGON_PLUGINS_ENABLED) are not configured."
-      );
-      return false;
-    }
-    try {
-      await initWalletProvider(runtime);
-    } catch (e) {
-      const errMsg = e instanceof Error ? e.message : String(e);
-      logger5.error(`WalletProvider initialization failed during validation: ${errMsg}`);
-      return false;
-    }
-    return true;
-  },
-  handler: async (runtime, message, state, _options, callback, _responses) => {
-    logger5.info("Handling PROPOSE_GOVERNANCE_POLYGON for message:", message.id);
-    const rawMessageText = message.content.text || "";
-    let extractedParams = null;
-    try {
-      const walletProvider = await initWalletProvider(runtime);
-      const actionRunner = new PolygonProposeGovernanceActionRunner(walletProvider);
-      const prompt = composePromptFromState4({
-        state,
-        template: proposeGovernanceActionTemplate
-      });
-      const modelResponse = await runtime.useModel(ModelType4.TEXT_SMALL, {
-        prompt
-      });
-      try {
-        const parsed = parseJSONObjectFromText3(modelResponse);
-        if (parsed) {
-          extractedParams = parsed;
-        }
-        logger5.debug(
-          "PROPOSE_GOVERNANCE_POLYGON: Extracted params via TEXT_SMALL:",
-          extractedParams
-        );
-        if (extractedParams?.error) {
-          logger5.warn(
-            `PROPOSE_GOVERNANCE_POLYGON: Model responded with error: ${extractedParams.error}`
-          );
-          throw new Error(extractedParams.error);
-        }
-      } catch (e) {
-        const errorMsg = e instanceof Error ? e.message : String(e);
-        logger5.warn(
-          `PROPOSE_GOVERNANCE_POLYGON: Failed to parse JSON from model response or model returned error (Proceeding to manual extraction): ${errorMsg}`
-        );
-      }
-      if (!extractedParams || extractedParams.error || !extractedParams.chain || !extractedParams.governorAddress || !extractedParams.targets || !extractedParams.values || !extractedParams.calldatas || !extractedParams.description) {
-        logger5.info(
-          "PROPOSE_GOVERNANCE_POLYGON: Model extraction insufficient, attempting manual parameter extraction from text."
-        );
-        const manualParams = extractProposeGovernanceParamsFromText(rawMessageText);
-        if (extractedParams && !extractedParams.error) {
-          extractedParams = {
-            chain: extractedParams.chain || manualParams.chain,
-            governorAddress: extractedParams.governorAddress || manualParams.governorAddress,
-            targets: extractedParams.targets && extractedParams.targets.length > 0 ? extractedParams.targets : manualParams.targets,
-            values: extractedParams.values && extractedParams.values.length > 0 ? extractedParams.values : manualParams.values,
-            calldatas: extractedParams.calldatas && extractedParams.calldatas.length > 0 ? extractedParams.calldatas : manualParams.calldatas,
-            description: extractedParams.description || manualParams.description
-          };
-        } else {
-          extractedParams = manualParams;
-        }
-        logger5.debug(
-          "PROPOSE_GOVERNANCE_POLYGON: Params after manual extraction attempt:",
-          extractedParams
-        );
-      }
-      if (!extractedParams?.chain || !extractedParams.governorAddress || !extractedParams.targets || !(extractedParams.targets.length > 0) || // Ensure targets is not empty
-      !extractedParams.values || !(extractedParams.values.length > 0) || // Ensure values is not empty
-      !extractedParams.calldatas || !(extractedParams.calldatas.length > 0) || // Ensure calldatas is not empty
-      !extractedParams.description) {
-        logger5.error(
-          "PROPOSE_GOVERNANCE_POLYGON: Incomplete parameters after all extraction attempts.",
-          extractedParams
-        );
-        throw new Error(
-          "Incomplete or invalid proposal parameters extracted after all attempts. Required: chain, governorAddress, targets, values, calldatas, description."
-        );
-      }
-      const proposeParams = extractedParams;
-      logger5.debug("Propose governance parameters for runner:", proposeParams);
-      const txResult = await actionRunner.propose(proposeParams);
-      let successMsg = `Proposed governance action on ${proposeParams.chain} to ${proposeParams.governorAddress}. Desc: "${proposeParams.description}". TxHash: ${txResult.hash}.`;
-      if (txResult.proposalId) {
-        successMsg += ` Proposal ID: ${txResult.proposalId}`;
-      }
-      logger5.info(successMsg);
-      if (callback) {
-        await callback({
-          text: successMsg,
-          content: { success: true, ...txResult },
-          actions: ["PROPOSE_GOVERNANCE_POLYGON"],
-          source: message.content.source
-        });
-      }
-      return { success: true, ...txResult };
-    } catch (error) {
-      const errMsg = error instanceof Error ? error.message : String(error);
-      logger5.error("Error in PROPOSE_GOVERNANCE_POLYGON handler:", errMsg, error);
-      if (callback) {
-        await callback({
-          text: `Error proposing governance action: ${errMsg}`,
-          actions: ["PROPOSE_GOVERNANCE_POLYGON"],
-          source: message.content.source
-        });
-      }
-      return { success: false, error: errMsg };
-    }
-  },
-  examples: [
-    [
-      {
-        name: "user",
-        content: {
-          text: 'Propose on polygon to governor 0x123 targets [0x456] values [0] calldatas [0x789] with description "Test proposal"'
-        }
-      },
-      {
-        name: "user",
-        content: {
-          text: "Create a new proposal. Chain: polygon. Governor: 0xabc. Targets: [0xdef]. Values: ['0']. Calldatas: ['0xghi']. Description: Hello world."
-        }
-      }
-    ]
-  ]
-};
-
-// src/actions/voteGovernance.ts
-import {
-  logger as logger6,
-  composePromptFromState as composePromptFromState5,
-  ModelType as ModelType5,
-  parseJSONObjectFromText as parseJSONObjectFromText4
-} from "@elizaos/core";
-import { encodeFunctionData as encodeFunctionData2 } from "viem";
-var governorVoteAbi = [
-  {
-    inputs: [
-      { name: "proposalId", type: "uint256" },
-      { name: "support", type: "uint8" }
-      // 0 = Against, 1 = For, 2 = Abstain
-      // { name: 'reason', type: 'string' }, // For castVoteWithReason (optional)
-    ],
-    name: "castVote",
-    // or castVoteWithReason
-    outputs: [],
-    // Typically returns a boolean success or nothing, tx receipt is key
-    stateMutability: "nonpayable",
-    type: "function"
-  }
-];
-var governorVoteWithReasonAbi = [
-  {
-    inputs: [
-      { name: "proposalId", type: "uint256" },
-      { name: "support", type: "uint8" },
-      { name: "reason", type: "string" }
-    ],
-    name: "castVoteWithReason",
-    outputs: [],
-    stateMutability: "nonpayable",
-    type: "function"
-  }
-];
-function extractVoteGovernanceParamsFromText(text) {
-  const params = {};
-  logger6.debug(`Attempting to extract VoteGovernanceParams from text: "${text}"`);
-  const chainMatch = text.match(/\b(?:on\s+|chain\s*[:\-]?\s*)(\w+)/i);
-  if (chainMatch?.[1]) params.chain = chainMatch[1].toLowerCase();
-  const governorMatch = text.match(/\b(?:governor\s*(?:address\s*)?[:\-]?\s*)(0x[a-fA-F0-9]{40})/i);
-  if (governorMatch?.[1]) params.governorAddress = governorMatch[1];
-  const proposalIdMatch = text.match(/\b(?:proposal\s*id|prop\s*id)\s*[:\-]?\s*([\w\d\-]+)/i);
-  if (proposalIdMatch?.[1]) params.proposalId = proposalIdMatch[1];
-  const supportForMatch = text.match(/\b(?:vote|support|option)\s*[:\-]?\s*(for|yes|aye)\b/i);
-  const supportAgainstMatch = text.match(
-    /\b(?:vote|support|option)\s*[:\-]?\s*(against|no|nay)\b/i
-  );
-  const supportAbstainMatch = text.match(/\b(?:vote|support|option)\s*[:\-]?\s*(abstain)\b/i);
-  const supportNumericMatch = text.match(/\b(?:vote|support|option)\s*[:\-]?\s*([012])\b/i);
-  if (supportForMatch) params.support = 1;
-  else if (supportAgainstMatch) params.support = 0;
-  else if (supportAbstainMatch) params.support = 2;
-  else if (supportNumericMatch?.[1]) params.support = Number.parseInt(supportNumericMatch[1], 10);
-  const reasonMatch = text.match(
-    /\b(?:reason|rationale)\s*[:\-]?\s*(?:['"“](.+?)['"”]|(.+?)(?:\s*\b(?:chain|governor|proposalId|support)\b|$))/i
-  );
-  if (reasonMatch) {
-    params.reason = (reasonMatch[1] || reasonMatch[2])?.trim();
-  }
-  logger6.debug("Manually extracted VoteGovernanceParams:", params);
-  return params;
-}
-var PolygonVoteGovernanceActionRunner = class {
-  constructor(walletProvider) {
-    this.walletProvider = walletProvider;
-  }
-  async vote(params) {
-    const walletClient = this.walletProvider.getWalletClient(params.chain);
-    const publicClient = this.walletProvider.getPublicClient(params.chain);
-    const chainConfig = this.walletProvider.getChainConfigs(params.chain);
-    if (!walletClient.account) {
-      throw new Error("Wallet client account is not available.");
-    }
-    const senderAddress = walletClient.account.address;
-    const proposalIdBigInt = BigInt(params.proposalId);
-    let txData;
-    if (params.reason && params.reason.trim() !== "") {
-      txData = encodeFunctionData2({
-        abi: governorVoteWithReasonAbi,
-        functionName: "castVoteWithReason",
-        args: [proposalIdBigInt, params.support, params.reason]
-      });
-    } else {
-      txData = encodeFunctionData2({
-        abi: governorVoteAbi,
-        functionName: "castVote",
-        args: [proposalIdBigInt, params.support]
-      });
-    }
-    try {
-      logger6.debug(
-        `Voting on chain ${params.chain}, governor ${params.governorAddress}, proposal ${params.proposalId}, support ${params.support}, reason: "${params.reason || ""}"`
-      );
-      const kzg = {
-        blobToKzgCommitment: (_blob) => {
-          throw new Error("KZG not impl.");
-        },
-        computeBlobKzgProof: (_blob, _commit) => {
-          throw new Error("KZG not impl.");
-        }
-      };
-      const hash = await walletClient.sendTransaction({
-        account: senderAddress,
-        to: params.governorAddress,
-        value: BigInt(0),
-        data: txData,
-        chain: chainConfig,
-        kzg
-      });
-      logger6.info(`Vote transaction sent. Hash: ${hash}. Waiting for receipt...`);
-      const receipt = await publicClient.waitForTransactionReceipt({ hash });
-      logger6.debug("Transaction receipt:", receipt);
-      return {
-        hash,
-        from: senderAddress,
-        to: params.governorAddress,
-        value: BigInt(0),
-        data: txData,
-        chainId: chainConfig.id,
-        logs: receipt.logs,
-        proposalId: params.proposalId,
-        support: params.support,
-        reason: params.reason
-      };
-    } catch (error) {
-      const errMsg = error instanceof Error ? error.message : String(error);
-      logger6.error(`Governance vote failed: ${errMsg}`, error);
-      throw new Error(`Governance vote failed: ${errMsg}`);
-    }
-  }
-};
-var voteGovernanceAction = {
-  name: "VOTE_GOVERNANCE_POLYGON",
-  similes: ["CAST_VOTE_POLYGON", "SUPPORT_PROPOSAL_POLYGON", "VOTE_ON_PROPOSAL_POLYGON"],
-  description: "Casts a vote on a governance proposal using the Polygon WalletProvider.",
-  validate: async (runtime) => {
-    logger6.debug("Validating VOTE_GOVERNANCE_POLYGON action...");
-    if (!runtime.getSetting("WALLET_PRIVATE_KEY") || !runtime.getSetting("POLYGON_PLUGINS_ENABLED")) {
-      logger6.error(
-        "Required settings (WALLET_PRIVATE_KEY, POLYGON_PLUGINS_ENABLED) are not configured."
-      );
-      return false;
-    }
-    try {
-      await initWalletProvider(runtime);
-    } catch (e) {
-      const errMsg = e instanceof Error ? e.message : String(e);
-      logger6.error(`WalletProvider initialization failed during validation: ${errMsg}`);
-      return false;
-    }
-    return true;
-  },
-  handler: async (runtime, message, state, _options, callback, _responses) => {
-    logger6.info("Handling VOTE_GOVERNANCE_POLYGON for message:", message.id);
-    const rawMessageText = message.content.text || "";
-    let extractedParams = null;
-    try {
-      const walletProvider = await initWalletProvider(runtime);
-      const actionRunner = new PolygonVoteGovernanceActionRunner(walletProvider);
-      const prompt = composePromptFromState5({
-        state,
-        template: voteGovernanceActionTemplate
-        // Use the new string template
-      });
-      const modelResponse = await runtime.useModel(ModelType5.TEXT_SMALL, {
-        prompt
-      });
-      try {
-        const parsed = parseJSONObjectFromText4(modelResponse);
-        if (parsed) {
-          extractedParams = parsed;
-        }
-        logger6.debug("VOTE_GOVERNANCE_POLYGON: Extracted params via TEXT_SMALL:", extractedParams);
-        if (extractedParams?.error) {
-          logger6.warn(
-            `VOTE_GOVERNANCE_POLYGON: Model responded with error: ${extractedParams.error}`
-          );
-          throw new Error(extractedParams.error);
-        }
-      } catch (e) {
-        const errorMsg = e instanceof Error ? e.message : String(e);
-        logger6.warn(
-          `VOTE_GOVERNANCE_POLYGON: Failed to parse JSON from model response or model returned error (Proceeding to manual extraction): ${errorMsg}`
-        );
-      }
-      if (!extractedParams || extractedParams.error || !extractedParams.chain || !extractedParams.governorAddress || extractedParams.proposalId === void 0 || extractedParams.support === void 0) {
-        logger6.info(
-          "VOTE_GOVERNANCE_POLYGON: Model extraction insufficient or failed, attempting manual parameter extraction."
-        );
-        const manualParams = extractVoteGovernanceParamsFromText(rawMessageText);
-        if (extractedParams && !extractedParams.error) {
-          extractedParams = {
-            chain: extractedParams.chain || manualParams.chain,
-            governorAddress: extractedParams.governorAddress || manualParams.governorAddress,
-            proposalId: extractedParams.proposalId || manualParams.proposalId,
-            support: extractedParams.support !== void 0 ? extractedParams.support : manualParams.support,
-            // Check for undefined explicitly for support
-            reason: extractedParams.reason || manualParams.reason
-          };
-        } else {
-          extractedParams = manualParams;
-        }
-        logger6.debug(
-          "VOTE_GOVERNANCE_POLYGON: Params after manual extraction attempt:",
-          extractedParams
-        );
-      }
-      if (!extractedParams?.chain || !extractedParams.governorAddress || extractedParams.proposalId === void 0 || // Check for undefined
-      typeof extractedParams.support !== "number" || // Check for number type and range
-      ![0, 1, 2].includes(extractedParams.support)) {
-        logger6.error(
-          "VOTE_GOVERNANCE_POLYGON: Incomplete or invalid parameters after all extraction attempts.",
-          extractedParams
-        );
-        throw new Error(
-          "Incomplete or invalid vote parameters: chain, governorAddress, proposalId, and support (0, 1, or 2) are required."
-        );
-      }
-      const voteParams = extractedParams;
-      logger6.debug("Vote governance parameters for runner:", voteParams);
-      const txResult = await actionRunner.vote(voteParams);
-      const successMsg = `Successfully voted on proposal ${voteParams.proposalId} on chain ${voteParams.chain} for governor ${voteParams.governorAddress}. Support: ${voteParams.support}. TxHash: ${txResult.hash}.`;
-      logger6.info(successMsg);
-      if (callback) {
-        await callback({
-          text: successMsg,
-          content: { success: true, ...txResult },
-          actions: ["VOTE_GOVERNANCE_POLYGON"],
-          source: message.content.source
-        });
-      }
-      return { success: true, ...txResult };
-    } catch (error) {
-      const errMsg = error instanceof Error ? error.message : String(error);
-      logger6.error("Error in VOTE_GOVERNANCE_POLYGON handler:", errMsg, error);
-      if (callback) {
-        await callback({
-          text: `Error voting on proposal: ${errMsg}`,
-          actions: ["VOTE_GOVERNANCE_POLYGON"],
-          source: message.content.source
-        });
-      }
-      return { success: false, error: errMsg };
-    }
-  },
-  examples: [
-    [
-      {
-        name: "user",
-        content: {
-          text: "Vote FOR proposal 123 on Polygon governor 0xGov. Chain: polygon."
-        }
-      },
-      {
-        name: "user",
-        content: {
-          text: "Support proposal 0xPropId with option 1 on governor 0xGovAddress for ethereum chain."
-        }
-      }
-    ]
-  ]
-};
-
 // src/actions/getValidatorInfo.ts
 import {
   logger as coreLogger,
-  composePromptFromState as composePromptFromState6,
-  ModelType as ModelType6
+  composePromptFromState as composePromptFromState4,
+  ModelType as ModelType4
 } from "@elizaos/core";
 import { formatUnits as formatUnits3 } from "viem";
 async function attemptParamExtraction(responseText) {
@@ -5084,14 +4401,14 @@ var getValidatorInfoAction = {
       if (!polygonService) {
         throw new ServiceError("PolygonRpcService not available", "PolygonRpcService");
       }
-      const prompt = composePromptFromState6({
+      const prompt = composePromptFromState4({
         state,
         template: getValidatorInfoTemplate
       });
       let params;
       try {
         try {
-          params = await runtime.useModel(ModelType6.OBJECT_LARGE, {
+          params = await runtime.useModel(ModelType4.OBJECT_LARGE, {
             prompt
           });
           coreLogger.debug("[GET_VALIDATOR_INFO_ACTION] Parsed LLM parameters:", params);
@@ -5103,7 +4420,7 @@ var getValidatorInfoAction = {
             "[GET_VALIDATOR_INFO_ACTION] OBJECT_LARGE model failed, falling back to TEXT_LARGE",
             error instanceof Error ? error : void 0
           );
-          const responseText = await runtime.useModel(ModelType6.LARGE, {
+          const responseText = await runtime.useModel(ModelType4.LARGE, {
             prompt
           });
           coreLogger.debug("[GET_VALIDATOR_INFO_ACTION] Raw text response from LLM:", responseText);
@@ -5281,8 +4598,8 @@ var getValidatorInfoAction = {
 // src/actions/getDelegatorInfo.ts
 import {
   logger as coreLogger2,
-  composePromptFromState as composePromptFromState7,
-  ModelType as ModelType7
+  composePromptFromState as composePromptFromState5,
+  ModelType as ModelType5
 } from "@elizaos/core";
 import { formatUnits as formatUnits4, Wallet as Wallet2 } from "ethers";
 var getDelegatorInfoAction = {
@@ -5324,14 +4641,14 @@ var getDelegatorInfoAction = {
       if (!polygonService) {
         throw new ServiceError("PolygonRpcService not available", PolygonRpcService.serviceType);
       }
-      const prompt = composePromptFromState7({
+      const prompt = composePromptFromState5({
         state,
         template: getDelegatorInfoTemplate
       });
       let params;
       try {
         try {
-          params = await runtime.useModel(ModelType7.OBJECT_LARGE, {
+          params = await runtime.useModel(ModelType5.OBJECT_LARGE, {
             prompt
           });
           coreLogger2.debug("[GET_DELEGATOR_INFO_ACTION] Parsed LLM parameters:", params);
@@ -5344,7 +4661,7 @@ var getDelegatorInfoAction = {
             "[GET_DELEGATOR_INFO_ACTION] OBJECT_LARGE model failed, falling back to TEXT_LARGE and manual parsing",
             error instanceof Error ? error : void 0
           );
-          const textResponse = await runtime.useModel(ModelType7.LARGE, {
+          const textResponse = await runtime.useModel(ModelType5.LARGE, {
             prompt
           });
           coreLogger2.debug("[GET_DELEGATOR_INFO_ACTION] Raw text response from LLM:", textResponse);
@@ -5540,10 +4857,10 @@ async function extractParamsFromText2(responseText) {
 
 // src/actions/withdrawRewardsL1.ts
 import {
-  logger as logger7,
-  composePromptFromState as composePromptFromState8,
-  ModelType as ModelType8,
-  parseJSONObjectFromText as parseJSONObjectFromText5
+  logger as logger5,
+  composePromptFromState as composePromptFromState6,
+  ModelType as ModelType6,
+  parseJSONObjectFromText as parseJSONObjectFromText3
 } from "@elizaos/core";
 function extractParamsFromText3(text) {
   const params = {};
@@ -5561,7 +4878,7 @@ var withdrawRewardsAction = {
   similes: ["CLAIM_L1_STAKING_REWARDS", "COLLECT_VALIDATOR_REWARDS_L1"],
   description: "Withdraws accumulated staking rewards from a Polygon validator on Ethereum L1.",
   validate: async (runtime, _message, _state) => {
-    logger7.debug("Validating WITHDRAW_REWARDS_L1 action...");
+    logger5.debug("Validating WITHDRAW_REWARDS_L1 action...");
     const requiredSettings = [
       "PRIVATE_KEY",
       "ETHEREUM_RPC_URL",
@@ -5570,18 +4887,18 @@ var withdrawRewardsAction = {
     ];
     for (const setting of requiredSettings) {
       if (!runtime.getSetting(setting)) {
-        logger7.error(`Required setting ${setting} not configured for WITHDRAW_REWARDS_L1 action.`);
+        logger5.error(`Required setting ${setting} not configured for WITHDRAW_REWARDS_L1 action.`);
         return false;
       }
     }
     try {
       const service = runtime.getService(PolygonRpcService.serviceType);
       if (!service) {
-        logger7.error("PolygonRpcService not initialized for WITHDRAW_REWARDS_L1.");
+        logger5.error("PolygonRpcService not initialized for WITHDRAW_REWARDS_L1.");
         return false;
       }
     } catch (error) {
-      logger7.error(
+      logger5.error(
         "Error accessing PolygonRpcService during WITHDRAW_REWARDS_L1 validation:",
         error
       );
@@ -5590,7 +4907,7 @@ var withdrawRewardsAction = {
     return true;
   },
   handler: async (runtime, message, state, _options, callback, _recentMessages) => {
-    logger7.info("Handling WITHDRAW_REWARDS_L1 action for message:", message.id);
+    logger5.info("Handling WITHDRAW_REWARDS_L1 action for message:", message.id);
     const rawMessageText = message.content.text || "";
     let params = null;
     try {
@@ -5598,22 +4915,22 @@ var withdrawRewardsAction = {
       if (!polygonService) {
         throw new Error("PolygonRpcService not available");
       }
-      const prompt = composePromptFromState8({
+      const prompt = composePromptFromState6({
         state,
         template: withdrawRewardsTemplate
       });
       try {
-        const result = await runtime.useModel(ModelType8.TEXT_SMALL, {
+        const result = await runtime.useModel(ModelType6.TEXT_SMALL, {
           prompt
         });
-        params = parseJSONObjectFromText5(result);
-        logger7.debug("WITHDRAW_REWARDS_L1: Extracted params via TEXT_SMALL:", params);
+        params = parseJSONObjectFromText3(result);
+        logger5.debug("WITHDRAW_REWARDS_L1: Extracted params via TEXT_SMALL:", params);
         if (params.error) {
-          logger7.warn(`WITHDRAW_REWARDS_L1: Model responded with error: ${params.error}`);
+          logger5.warn(`WITHDRAW_REWARDS_L1: Model responded with error: ${params.error}`);
           throw new Error(params.error);
         }
       } catch (e) {
-        logger7.warn(
+        logger5.warn(
           "WITHDRAW_REWARDS_L1: Failed to parse JSON from model response, trying manual extraction",
           e
         );
@@ -5622,7 +4939,7 @@ var withdrawRewardsAction = {
           params = {
             validatorId: manualParams.validatorId
           };
-          logger7.debug("WITHDRAW_REWARDS_L1: Extracted params via manual text parsing:", params);
+          logger5.debug("WITHDRAW_REWARDS_L1: Extracted params via manual text parsing:", params);
         } else {
           throw new Error("Could not determine validator ID from the message.");
         }
@@ -5631,10 +4948,10 @@ var withdrawRewardsAction = {
         throw new Error("Validator ID is missing after extraction attempts.");
       }
       const { validatorId } = params;
-      logger7.debug(`WITHDRAW_REWARDS_L1 parameters: validatorId: ${validatorId}`);
+      logger5.debug(`WITHDRAW_REWARDS_L1 parameters: validatorId: ${validatorId}`);
       const txHash = await polygonService.withdrawRewards(validatorId);
       const successMsg = `Successfully initiated withdrawal of rewards from validator ${validatorId} on L1. Transaction hash: ${txHash}`;
-      logger7.info(successMsg);
+      logger5.info(successMsg);
       const responseContent = {
         text: successMsg,
         actions: ["WITHDRAW_REWARDS_L1"],
@@ -5651,7 +4968,7 @@ var withdrawRewardsAction = {
       return responseContent;
     } catch (error) {
       const parsedError = parseErrorMessage(error);
-      logger7.error("Error in WITHDRAW_REWARDS_L1 handler:", parsedError);
+      logger5.error("Error in WITHDRAW_REWARDS_L1 handler:", parsedError);
       const errorContent = {
         text: `Error withdrawing rewards: ${parsedError.message}`,
         actions: ["WITHDRAW_REWARDS_L1"],
@@ -5690,10 +5007,10 @@ var withdrawRewardsAction = {
 
 // src/actions/bridgeDeposit.ts
 import {
-  logger as logger8,
-  composePromptFromState as composePromptFromState9,
-  ModelType as ModelType9,
-  parseJSONObjectFromText as parseJSONObjectFromText6
+  logger as logger6,
+  composePromptFromState as composePromptFromState7,
+  ModelType as ModelType7,
+  parseJSONObjectFromText as parseJSONObjectFromText4
 } from "@elizaos/core";
 import {
   createConfig,
@@ -5701,7 +5018,7 @@ import {
   getRoutes
 } from "@lifi/sdk";
 import {
-  parseUnits as parseUnits4,
+  parseUnits as parseUnits3,
   parseAbi
 } from "viem";
 import { EVM } from "@lifi/sdk";
@@ -5765,7 +5082,7 @@ var PolygonBridgeActionRunner = class {
       });
     } catch (err) {
       const errorMessage = err instanceof Error ? err.message : String(err);
-      logger8.warn(
+      logger6.warn(
         `Could not fetch decimals for ${tokenAddress} on ${chainName}, defaulting to 18. Error: ${errorMessage}`
       );
       return 18;
@@ -5789,7 +5106,7 @@ var PolygonBridgeActionRunner = class {
                 const hash = process2.txHash;
                 if (!txHashSent && hash) {
                   txHashSent = true;
-                  logger8.info(`Bridge transaction hash available: ${hash}`);
+                  logger6.info(`Bridge transaction hash available: ${hash}`);
                   onTxHash(hash);
                 }
               }
@@ -5799,27 +5116,27 @@ var PolygonBridgeActionRunner = class {
             (step) => step.execution?.status === "DONE" || step.execution?.status === "FAILED"
           );
           if (isComplete && onDone) {
-            logger8.info(`Bridge operation completed`);
+            logger6.info(`Bridge operation completed`);
             onDone(updatedRoute);
           }
         }
       });
     } catch (error) {
       const err = error instanceof Error ? error : new Error(String(error));
-      logger8.error("Bridge execution error:", err);
+      logger6.error("Bridge execution error:", err);
       if (onError) {
         onError(err);
       }
     }
   }
   async bridge(params) {
-    logger8.debug("Available chains in WalletProvider:", Object.keys(this.walletProvider.chains));
-    logger8.debug(`Attempting to get wallet client for chain: ${params.fromChain}`);
+    logger6.debug("Available chains in WalletProvider:", Object.keys(this.walletProvider.chains));
+    logger6.debug(`Attempting to get wallet client for chain: ${params.fromChain}`);
     const walletClient = this.walletProvider.getWalletClient(params.fromChain);
     const [fromAddress] = await walletClient.getAddresses();
     const fromTokenDecimals = await this.getTokenDecimals(params.fromChain, params.fromToken);
-    const amountRaw = parseUnits4(params.amount, fromTokenDecimals).toString();
-    logger8.debug(
+    const amountRaw = parseUnits3(params.amount, fromTokenDecimals).toString();
+    logger6.debug(
       `Converted ${params.amount} tokens to ${amountRaw} base units using ${fromTokenDecimals} decimals`
     );
     const fromChainId = this.walletProvider.getChainConfigs(params.fromChain).id;
@@ -5833,29 +5150,29 @@ var PolygonBridgeActionRunner = class {
       fromAddress,
       toAddress: params.toAddress || fromAddress
     };
-    logger8.debug("Requesting bridge routes with:", routeRequest);
+    logger6.debug("Requesting bridge routes with:", routeRequest);
     try {
       const routes = await getRoutes(routeRequest);
       if (!routes.routes || routes.routes.length === 0) {
-        logger8.error("No routes found for this bridge transaction");
+        logger6.error("No routes found for this bridge transaction");
         throw new Error("No routes found for bridging tokens between these chains");
       }
-      logger8.debug(`Found ${routes.routes.length} routes, using the best route`);
+      logger6.debug(`Found ${routes.routes.length} routes, using the best route`);
       const bestRoute = routes.routes[0];
-      logger8.debug("Best route selected:", JSON.stringify(bestRoute, null, 2));
+      logger6.debug("Best route selected:", JSON.stringify(bestRoute, null, 2));
       if (bestRoute.steps[0]?.estimate?.gasCosts) {
-        logger8.debug(
+        logger6.debug(
           "Estimated gas costs:",
           JSON.stringify(bestRoute.steps[0].estimate.gasCosts, null, 2)
         );
       }
       if (bestRoute.steps[0]?.estimate?.feeCosts) {
-        logger8.debug(
+        logger6.debug(
           "Estimated fee costs:",
           JSON.stringify(bestRoute.steps[0].estimate.feeCosts, null, 2)
         );
       }
-      logger8.debug("Executing bridge route");
+      logger6.debug("Executing bridge route");
       const txHashPromise = new Promise((resolve, reject) => {
         this.bridgeAndStream(
           bestRoute,
@@ -5865,20 +5182,20 @@ var PolygonBridgeActionRunner = class {
           },
           // Called when the bridge is complete (optional)
           (execution) => {
-            logger8.info(`Bridge operation completed`);
+            logger6.info(`Bridge operation completed`);
           },
           // Error handler
           (error) => {
-            logger8.error(`Bridge operation failed:`, error);
+            logger6.error(`Bridge operation failed:`, error);
             reject(error);
           }
         );
       });
       try {
         const txHash = await txHashPromise;
-        logger8.info(`Returning bridge transaction hash: ${txHash}`);
+        logger6.info(`Returning bridge transaction hash: ${txHash}`);
         const isNativeToken = params.fromToken.toLowerCase() === "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee" || params.fromToken.toLowerCase() === "0x0000000000000000000000000000000000000000";
-        const txValue = isNativeToken ? parseUnits4(params.amount, fromTokenDecimals) : BigInt(0);
+        const txValue = isNativeToken ? parseUnits3(params.amount, fromTokenDecimals) : BigInt(0);
         const tx = {
           hash: txHash,
           from: fromAddress,
@@ -5888,11 +5205,11 @@ var PolygonBridgeActionRunner = class {
           chainId: fromChainId
         };
         const txForLog = { ...tx, valueRaw: tx.valueRaw.toString() };
-        logger8.debug("Returning transaction:", JSON.stringify(txForLog, null, 2));
+        logger6.debug("Returning transaction:", JSON.stringify(txForLog, null, 2));
         return tx;
       } catch (error) {
         const errorMessage = error instanceof Error ? error.message : String(error);
-        logger8.error(`Bridge transaction hash retrieval failed: ${errorMessage}`, error);
+        logger6.error(`Bridge transaction hash retrieval failed: ${errorMessage}`, error);
         return {
           hash: "0x0",
           // A placeholder hash indicating failure
@@ -5905,7 +5222,7 @@ var PolygonBridgeActionRunner = class {
       }
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error);
-      logger8.error(`Bridge transaction failed: ${errorMessage}`, error);
+      logger6.error(`Bridge transaction failed: ${errorMessage}`, error);
       return {
         hash: "0x0",
         // A placeholder hash indicating failure
@@ -5923,57 +5240,57 @@ var bridgeDepositAction = {
   similes: ["POLYGON_BRIDGE_FUNDS", "MOVE_ETH_TO_POLYGON_LIFI"],
   description: "Initiates a deposit/bridge using LiFi.",
   validate: async (runtime, _m, _s) => {
-    logger8.debug("Validating BRIDGE_DEPOSIT_POLYGON...");
+    logger6.debug("Validating BRIDGE_DEPOSIT_POLYGON...");
     const checks = [
       runtime.getSetting("WALLET_PRIVATE_KEY"),
       runtime.getSetting("POLYGON_PLUGINS_ENABLED")
     ];
     if (checks.some((check) => !check)) {
-      logger8.error("Required settings (WALLET_PRIVATE_KEY, POLYGON_PLUGINS_ENABLED) missing.");
+      logger6.error("Required settings (WALLET_PRIVATE_KEY, POLYGON_PLUGINS_ENABLED) missing.");
       return false;
     }
     try {
       await initWalletProvider(runtime);
     } catch (e) {
       const errMsg = e instanceof Error ? e.message : String(e);
-      logger8.error(`WalletProvider initialization failed during validation: ${errMsg} `);
+      logger6.error(`WalletProvider initialization failed during validation: ${errMsg} `);
       return false;
     }
     return true;
   },
   handler: async (runtime, message, state, _o, cb, _rs) => {
-    logger8.info("Handling BRIDGE_DEPOSIT_POLYGON for:", message.id);
+    logger6.info("Handling BRIDGE_DEPOSIT_POLYGON for:", message.id);
     try {
       const walletProvider = await initWalletProvider(runtime);
       const actionRunner = new PolygonBridgeActionRunner(walletProvider);
-      const prompt = composePromptFromState9({
+      const prompt = composePromptFromState7({
         state,
         template: bridgeDepositPolygonTemplate
       });
-      const modelResponse = await runtime.useModel(ModelType9.TEXT_SMALL, {
+      const modelResponse = await runtime.useModel(ModelType7.TEXT_SMALL, {
         prompt
       });
       let paramsJson;
       let bridgeOptions;
       try {
-        paramsJson = parseJSONObjectFromText6(modelResponse);
-        logger8.debug("Bridge parameters extracted:", paramsJson);
+        paramsJson = parseJSONObjectFromText4(modelResponse);
+        logger6.debug("Bridge parameters extracted:", paramsJson);
         if ("error" in paramsJson) {
-          logger8.warn(`Bridge action: Model responded with error: ${paramsJson.error}`);
+          logger6.warn(`Bridge action: Model responded with error: ${paramsJson.error}`);
           throw new Error(paramsJson.error);
         }
         bridgeOptions = paramsJson;
       } catch (e) {
-        logger8.error("Failed to parse LLM response for bridge params:", modelResponse, e);
+        logger6.error("Failed to parse LLM response for bridge params:", modelResponse, e);
         throw new Error("Could not understand bridge parameters.");
       }
       if (!bridgeOptions.fromChain || !bridgeOptions.toChain || !bridgeOptions.fromToken || !bridgeOptions.toToken || !bridgeOptions.amount) {
         throw new Error("Incomplete bridge parameters extracted.");
       }
-      logger8.debug("Parsed bridge options:", bridgeOptions);
+      logger6.debug("Parsed bridge options:", bridgeOptions);
       const bridgeResp = await actionRunner.bridge(bridgeOptions);
       if (bridgeResp.error) {
-        logger8.error("Bridge operation failed:", bridgeResp.error);
+        logger6.error("Bridge operation failed:", bridgeResp.error);
         throw new Error(bridgeResp.error);
       }
       const fromChainFormatted = bridgeOptions.fromChain.charAt(0).toUpperCase() + bridgeOptions.fromChain.slice(1);
@@ -5984,7 +5301,7 @@ Initiating transfer of ${bridgeOptions.amount} tokens from ${fromChainFormatted}
 Transaction hash: ${bridgeResp.hash}
 
 The bridge operation is now in progress and will continue in the background. This may take several minutes to complete. You can check the status by tracking the transaction hash.`;
-      logger8.info(`Bridge transaction initiated: ${bridgeResp.hash}`);
+      logger6.info(`Bridge transaction initiated: ${bridgeResp.hash}`);
       if (cb) {
         await cb({
           text: successMessage,
@@ -6010,7 +5327,7 @@ The bridge operation is now in progress and will continue in the background. Thi
       };
     } catch (error) {
       const errMsg = error instanceof Error ? error.message : String(error);
-      logger8.error("BRIDGE_DEPOSIT_POLYGON handler error:", errMsg, error);
+      logger6.error("BRIDGE_DEPOSIT_POLYGON handler error:", errMsg, error);
       if (cb) {
         await cb({
           text: `Error bridging: ${errMsg}`,
@@ -6041,7 +5358,7 @@ The bridge operation is now in progress and will continue in the background. Thi
 
 // src/actions/getL2BlockNumber.ts
 import {
-  logger as logger9
+  logger as logger7
 } from "@elizaos/core";
 var getL2BlockNumberAction = {
   name: "GET_L2_BLOCK_NUMBER",
@@ -6049,7 +5366,7 @@ var getL2BlockNumberAction = {
   description: "Gets the current block number on Polygon (L2).",
   validate: async (runtime, message, state) => {
     const content = message.content?.text?.toLowerCase() || "";
-    logger9.info(`[getL2BlockNumberAction] Validating message: "${content}"`);
+    logger7.info(`[getL2BlockNumberAction] Validating message: "${content}"`);
     const blockNumberKeywords = [
       "block number",
       "current block",
@@ -6063,11 +5380,11 @@ var getL2BlockNumberAction = {
       "show polygon block number"
     ];
     const matches = blockNumberKeywords.some((keyword) => content.includes(keyword));
-    logger9.info(`[getL2BlockNumberAction] Validation result: ${matches}`);
+    logger7.info(`[getL2BlockNumberAction] Validation result: ${matches}`);
     return matches;
   },
   handler: async (runtime, message, state, options, callback) => {
-    logger9.info("[getL2BlockNumberAction] Handler called!");
+    logger7.info("[getL2BlockNumberAction] Handler called!");
     const rpcService = runtime.getService(PolygonRpcService.serviceType);
     if (!rpcService) {
       throw new Error("PolygonRpcService not available");
@@ -6088,7 +5405,7 @@ var getL2BlockNumberAction = {
       }
       return responseContent;
     } catch (error) {
-      logger9.error("Error getting L2 block number:", error);
+      logger7.error("Error getting L2 block number:", error);
       const errorMessage = error instanceof Error ? error.message : String(error);
       const errorContent = {
         text: `Error retrieving current Polygon block number: ${errorMessage}`,
@@ -6137,7 +5454,7 @@ var getL2BlockNumberAction = {
 
 // src/actions/getMaticBalance.ts
 import {
-  logger as logger10,
+  logger as logger8,
   elizaLogger as elizaLogger3
 } from "@elizaos/core";
 import { ethers as ethers3 } from "ethers";
@@ -6147,7 +5464,7 @@ var getMaticBalanceAction = {
   description: "Gets the MATIC balance for the agent's address on Polygon (L2).",
   validate: async (runtime, message, state) => {
     const content = message.content?.text?.toLowerCase() || "";
-    logger10.info(`[getMaticBalanceAction] VALIDATION CALLED - message: "${content}"`);
+    logger8.info(`[getMaticBalanceAction] VALIDATION CALLED - message: "${content}"`);
     try {
       const maticBalanceKeywords = [
         "matic balance",
@@ -6164,22 +5481,22 @@ var getMaticBalanceAction = {
         "check my matic"
       ];
       const matches = maticBalanceKeywords.some((keyword) => content.includes(keyword));
-      logger10.info(
+      logger8.info(
         `[getMaticBalanceAction] Validation result: ${matches} (keywords checked: ${maticBalanceKeywords.length})`
       );
       const rpcService = runtime.getService(PolygonRpcService.serviceType);
       if (!rpcService) {
-        logger10.warn(`[getMaticBalanceAction] PolygonRpcService not available - validation false`);
+        logger8.warn(`[getMaticBalanceAction] PolygonRpcService not available - validation false`);
         return false;
       }
       return matches;
     } catch (error) {
-      logger10.error(`[getMaticBalanceAction] Validation error:`, error);
+      logger8.error(`[getMaticBalanceAction] Validation error:`, error);
       return false;
     }
   },
   handler: async (runtime, message, state, options, callback) => {
-    logger10.info("[getMaticBalanceAction] Handler called!");
+    logger8.info("[getMaticBalanceAction] Handler called!");
     const rpcService = runtime.getService(PolygonRpcService.serviceType);
     if (!rpcService) throw new Error("PolygonRpcService not available");
     try {
@@ -6191,7 +5508,7 @@ var getMaticBalanceAction = {
       }
       const agentAddress = polygonWalletProvider2.getAddress();
       if (!agentAddress) throw new Error("Could not determine agent address from provider");
-      logger10.info(`Fetching MATIC balance for address: ${agentAddress}`);
+      logger8.info(`Fetching MATIC balance for address: ${agentAddress}`);
       const balanceWei = await rpcService.getBalance(agentAddress, "L2");
       elizaLogger3.info(`Balance: ${balanceWei}`);
       const balanceMatic = ethers3.formatEther(balanceWei);
@@ -6209,7 +5526,7 @@ var getMaticBalanceAction = {
       }
       return responseContent;
     } catch (error) {
-      logger10.error("Error getting MATIC balance:", error);
+      logger8.error("Error getting MATIC balance:", error);
       const errorMessage = error instanceof Error ? error.message : String(error);
       const userMessage = errorMessage.includes("private key") ? "There was an issue with the wallet configuration. Please ensure PRIVATE_KEY is correctly set." : `Error retrieving MATIC balance: ${errorMessage}`;
       const errorContent = {
@@ -6319,12 +5636,12 @@ var getPolygonGasEstimatesAction = {
 
 // src/actions/undelegateL1.ts
 import {
-  logger as logger11,
-  composePromptFromState as composePromptFromState10,
-  ModelType as ModelType10,
-  parseJSONObjectFromText as parseJSONObjectFromText7
+  logger as logger9,
+  composePromptFromState as composePromptFromState8,
+  ModelType as ModelType8,
+  parseJSONObjectFromText as parseJSONObjectFromText5
 } from "@elizaos/core";
-import { parseUnits as parseUnits5 } from "ethers";
+import { parseUnits as parseUnits4 } from "ethers";
 
 // src/utils.ts
 function parseBigIntString(value, unitName) {
@@ -6348,22 +5665,36 @@ function extractParamsFromText4(text) {
       params.validatorId = id;
     }
   }
-  const sharesMatch = text.match(/(\\d*\\.?\\d+)\\s*(?:shares?|validator shares?)?/i);
-  if (sharesMatch?.[1]) {
+  const maticMatch = text.match(/(\\d*\\.?\\d+)\\s*matic/i);
+  if (maticMatch?.[1]) {
     try {
-      params.sharesAmountWei = parseUnits5(sharesMatch[1], 18).toString();
+      params.maticAmount = maticMatch[1];
     } catch (e) {
-      logger11.warn(`Could not parse shares amount from text: ${sharesMatch[1]}`, e);
+      logger9.warn(`Could not parse MATIC amount from text: ${maticMatch[1]}`, e);
+    }
+  } else {
+    const sharesMatch = text.match(/(\\d*\\.?\\d+)\\s*(?:shares?|validator shares?)?/i);
+    if (sharesMatch?.[1]) {
+      try {
+        params.sharesAmountWei = parseUnits4(sharesMatch[1], 18).toString();
+      } catch (e) {
+        logger9.warn(`Could not parse shares amount from text: ${sharesMatch[1]}`, e);
+      }
     }
   }
   return params;
 }
 var undelegateL1Action = {
-  name: "UNDELEGATE_L1",
-  similes: ["UNSTAKE_L1_SHARES", "UNBOND_VALIDATOR_SHARES_L1", "SELL_VALIDATOR_SHARES_L1"],
+  name: "UNSTAKE_L1",
+  similes: [
+    "UNDELEGATE_L1",
+    "UNSTAKE_L1_SHARES",
+    "UNBOND_VALIDATOR_SHARES_L1",
+    "SELL_VALIDATOR_SHARES_L1"
+  ],
   description: "Initiates undelegation (unbonding) of Validator Shares from a Polygon validator on Ethereum L1.",
   validate: async (runtime, _message, _state) => {
-    logger11.debug("Validating UNDELEGATE_L1 action...");
+    logger9.debug("Validating UNSTAKE_L1 action...");
     const requiredSettings = [
       "PRIVATE_KEY",
       "ETHEREUM_RPC_URL",
@@ -6373,24 +5704,24 @@ var undelegateL1Action = {
     ];
     for (const setting of requiredSettings) {
       if (!runtime.getSetting(setting)) {
-        logger11.error(`Required setting ${setting} not configured for UNDELEGATE_L1 action.`);
+        logger9.error(`Required setting ${setting} not configured for UNSTAKE_L1 action.`);
         return false;
       }
     }
     try {
       const service = runtime.getService(PolygonRpcService.serviceType);
       if (!service) {
-        logger11.error("PolygonRpcService not initialized for UNDELEGATE_L1.");
+        logger9.error("PolygonRpcService not initialized for UNSTAKE_L1.");
         return false;
       }
     } catch (error) {
-      logger11.error("Error accessing PolygonRpcService during UNDELEGATE_L1 validation:", error);
+      logger9.error("Error accessing PolygonRpcService during UNSTAKE_L1 validation:", error);
       return false;
     }
     return true;
   },
   handler: async (runtime, message, state, _options, callback, _recentMessages) => {
-    logger11.info("Handling UNDELEGATE_L1 action for message:", message.id);
+    logger9.info("Handling UNSTAKE_L1 action for message:", message.id);
     const rawMessageText = message.content.text || "";
     let params = null;
     try {
@@ -6398,56 +5729,70 @@ var undelegateL1Action = {
       if (!rpcService) {
         throw new Error("PolygonRpcService not available");
       }
-      const prompt = composePromptFromState10({
+      const prompt = composePromptFromState8({
         state,
         template: undelegateL1Template
       });
       try {
-        const result = await runtime.useModel(ModelType10.TEXT_SMALL, {
+        const result = await runtime.useModel(ModelType8.TEXT_SMALL, {
           prompt
         });
-        params = parseJSONObjectFromText7(result);
-        logger11.debug("UNDELEGATE_L1: Extracted params via TEXT_SMALL:", params);
+        params = parseJSONObjectFromText5(result);
+        logger9.debug("UNSTAKE_L1: Extracted params via TEXT_SMALL:", params);
         if (params.error) {
-          logger11.warn(`UNDELEGATE_L1: Model responded with error: ${params.error}`);
+          logger9.warn(`UNSTAKE_L1: Model responded with error: ${params.error}`);
           throw new Error(params.error);
         }
       } catch (e) {
-        logger11.warn(
-          "UNDELEGATE_L1: Failed to parse JSON from model response, trying manual extraction",
+        logger9.warn(
+          "UNSTAKE_L1: Failed to parse JSON from model response, trying manual extraction",
           e
         );
         const manualParams = extractParamsFromText4(rawMessageText);
-        if (manualParams.validatorId && manualParams.sharesAmountWei) {
+        if (manualParams.validatorId && (manualParams.sharesAmountWei || manualParams.maticAmount)) {
           params = {
             validatorId: manualParams.validatorId,
-            sharesAmountWei: manualParams.sharesAmountWei
+            sharesAmountWei: manualParams.sharesAmountWei,
+            maticAmount: manualParams.maticAmount
           };
-          logger11.debug("UNDELEGATE_L1: Extracted params via manual text parsing:", params);
+          logger9.debug("UNSTAKE_L1: Extracted params via manual text parsing:", params);
         } else {
-          throw new Error("Could not determine validator ID or shares amount from the message.");
+          throw new Error("Could not determine validator ID or amount from the message.");
         }
       }
-      if (!params?.validatorId || !params.sharesAmountWei) {
-        throw new Error("Validator ID or shares amount is missing after extraction attempts.");
+      if (!params?.validatorId || !params.sharesAmountWei && !params.maticAmount) {
+        throw new Error("Validator ID or amount is missing after extraction attempts.");
       }
-      const { validatorId, sharesAmountWei } = params;
-      logger11.debug(
-        `UNDELEGATE_L1 parameters: validatorId: ${validatorId}, sharesAmountWei: ${sharesAmountWei}`
+      const { validatorId } = params;
+      let sharesAmountBigInt;
+      if (params.maticAmount) {
+        logger9.debug(`Converting MATIC amount to shares for validator ${validatorId}...`);
+        const maticAmountWei = parseUnits4(params.maticAmount, 18).toString();
+        const maticAmountBigInt = parseBigIntString(maticAmountWei, "MATIC");
+        sharesAmountBigInt = await rpcService.convertMaticToShares(validatorId, maticAmountBigInt);
+        logger9.debug(`Converted ${params.maticAmount} MATIC to ${sharesAmountBigInt} shares`);
+      } else {
+        sharesAmountBigInt = parseBigIntString(params.sharesAmountWei, "shares");
+        logger9.debug(`Using direct shares amount: ${sharesAmountBigInt}`);
+      }
+      logger9.debug(
+        `UNSTAKE_L1 parameters: validatorId: ${validatorId}, sharesAmount: ${sharesAmountBigInt}`
       );
-      const sharesAmountBigInt = parseBigIntString(sharesAmountWei, "shares");
       const txHash = await rpcService.undelegate(validatorId, sharesAmountBigInt);
       const successMsg = `Undelegation transaction sent to L1: ${txHash}. Unbonding period applies.`;
-      logger11.info(successMsg);
+      logger9.info(successMsg);
       const responseContent = {
         text: successMsg,
-        actions: ["UNDELEGATE_L1"],
+        actions: ["UNSTAKE_L1"],
         source: message.content.source,
         data: {
           transactionHash: txHash,
           status: "pending",
           validatorId,
-          sharesAmountWei
+          sharesAmountWei: sharesAmountBigInt.toString(),
+          ...params.maticAmount && {
+            maticAmount: params.maticAmount
+          }
         }
       };
       if (callback) {
@@ -6456,10 +5801,10 @@ var undelegateL1Action = {
       return responseContent;
     } catch (error) {
       const parsedError = parseErrorMessage(error);
-      logger11.error("Error in UNDELEGATE_L1 handler:", parsedError);
+      logger9.error("Error in UNSTAKE_L1 handler:", parsedError);
       const errorContent = {
         text: `Error undelegating shares (L1): ${parsedError.message}`,
-        actions: ["UNDELEGATE_L1"],
+        actions: ["UNSTAKE_L1"],
         source: message.content.source,
         data: {
           success: false,
@@ -6489,16 +5834,32 @@ var undelegateL1Action = {
           text: "Unstake 5.5 validator shares from the Polygon validator ID 42"
         }
       }
+    ],
+    [
+      {
+        name: "user",
+        content: {
+          text: "Undelegate 0.5 MATIC from validator 157"
+        }
+      }
+    ],
+    [
+      {
+        name: "user",
+        content: {
+          text: "Unstake 2.5 MATIC from the Polygon validator ID 100"
+        }
+      }
     ]
   ]
 };
 
 // src/actions/restakeRewardsL1.ts
 import {
-  logger as logger12,
-  composePromptFromState as composePromptFromState11,
-  ModelType as ModelType11,
-  parseJSONObjectFromText as parseJSONObjectFromText8
+  logger as logger10,
+  composePromptFromState as composePromptFromState9,
+  ModelType as ModelType9,
+  parseJSONObjectFromText as parseJSONObjectFromText6
 } from "@elizaos/core";
 function extractParamsFromText5(text) {
   const params = {};
@@ -6516,22 +5877,22 @@ var restakeRewardsL1Action = {
   similes: ["COMPOUND_L1_REWARDS", "REINVEST_STAKING_REWARDS_L1"],
   description: "Withdraws accumulated L1 staking rewards and re-delegates them to the same Polygon validator.",
   validate: async (runtime, _message, _state) => {
-    logger12.debug("Validating RESTAKE_REWARDS_L1 action...");
+    logger10.debug("Validating RESTAKE_REWARDS_L1 action...");
     const requiredSettings = ["PRIVATE_KEY", "ETHEREUM_RPC_URL", "POLYGON_PLUGINS_ENABLED"];
     for (const setting of requiredSettings) {
       if (!runtime.getSetting(setting)) {
-        logger12.error(`Required setting ${setting} not configured for RESTAKE_REWARDS_L1 action.`);
+        logger10.error(`Required setting ${setting} not configured for RESTAKE_REWARDS_L1 action.`);
         return false;
       }
     }
     try {
       const service = runtime.getService(PolygonRpcService.serviceType);
       if (!service) {
-        logger12.error("PolygonRpcService not initialized for RESTAKE_REWARDS_L1.");
+        logger10.error("PolygonRpcService not initialized for RESTAKE_REWARDS_L1.");
         return false;
       }
     } catch (error) {
-      logger12.error(
+      logger10.error(
         "Error accessing PolygonRpcService during RESTAKE_REWARDS_L1 validation:",
         error
       );
@@ -6540,7 +5901,7 @@ var restakeRewardsL1Action = {
     return true;
   },
   handler: async (runtime, message, state, _options, callback, _recentMessages) => {
-    logger12.info("Handling RESTAKE_REWARDS_L1 action for message:", message.id);
+    logger10.info("Handling RESTAKE_REWARDS_L1 action for message:", message.id);
     const rawMessageText = message.content.text || "";
     let params = null;
     try {
@@ -6548,28 +5909,28 @@ var restakeRewardsL1Action = {
       if (!polygonService) {
         throw new Error("PolygonRpcService not available");
       }
-      const prompt = composePromptFromState11({
+      const prompt = composePromptFromState9({
         state,
         template: restakeRewardsL1Template
         // Use the new template
       });
       try {
-        const result = await runtime.useModel(ModelType11.TEXT_SMALL, { prompt });
-        params = parseJSONObjectFromText8(result);
-        logger12.debug("RESTAKE_REWARDS_L1: Extracted params via TEXT_SMALL:", params);
+        const result = await runtime.useModel(ModelType9.TEXT_SMALL, { prompt });
+        params = parseJSONObjectFromText6(result);
+        logger10.debug("RESTAKE_REWARDS_L1: Extracted params via TEXT_SMALL:", params);
         if (params.error) {
-          logger12.warn(`RESTAKE_REWARDS_L1: Model responded with error: ${params.error}`);
+          logger10.warn(`RESTAKE_REWARDS_L1: Model responded with error: ${params.error}`);
           throw new Error(params.error);
         }
       } catch (e) {
-        logger12.warn(
+        logger10.warn(
           "RESTAKE_REWARDS_L1: Failed to parse JSON from model, trying manual extraction",
           e
         );
         const manualParams = extractParamsFromText5(rawMessageText);
         if (manualParams.validatorId) {
           params = { validatorId: manualParams.validatorId };
-          logger12.debug("RESTAKE_REWARDS_L1: Extracted params via manual text parsing:", params);
+          logger10.debug("RESTAKE_REWARDS_L1: Extracted params via manual text parsing:", params);
         } else {
           throw new Error("Could not determine validator ID from the message.");
         }
@@ -6578,11 +5939,11 @@ var restakeRewardsL1Action = {
         throw new Error("Validator ID is missing after extraction attempts.");
       }
       const { validatorId } = params;
-      logger12.info(`Action: Restaking rewards for validator ${validatorId} on L1`);
+      logger10.info(`Action: Restaking rewards for validator ${validatorId} on L1`);
       const delegateTxHash = await polygonService.restakeRewards(validatorId);
       if (!delegateTxHash) {
         const noRewardsMsg = `No rewards found to restake for validator ${validatorId}.`;
-        logger12.info(noRewardsMsg);
+        logger10.info(noRewardsMsg);
         const responseContent2 = {
           text: noRewardsMsg,
           actions: ["RESTAKE_REWARDS_L1"],
@@ -6594,7 +5955,7 @@ var restakeRewardsL1Action = {
         return responseContent2;
       }
       const successMsg = `Restake operation for validator ${validatorId} initiated. Final delegation transaction hash: ${delegateTxHash}.`;
-      logger12.info(successMsg);
+      logger10.info(successMsg);
       const responseContent = {
         text: successMsg,
         actions: ["RESTAKE_REWARDS_L1"],
@@ -6610,7 +5971,7 @@ var restakeRewardsL1Action = {
       return responseContent;
     } catch (error) {
       const parsedError = parseErrorMessage(error);
-      logger12.error("Error in RESTAKE_REWARDS_L1 handler:", parsedError);
+      logger10.error("Error in RESTAKE_REWARDS_L1 handler:", parsedError);
       const errorContent = {
         text: `Error restaking rewards (L1): ${parsedError.message}`,
         actions: ["RESTAKE_REWARDS_L1"],
@@ -6647,16 +6008,16 @@ var restakeRewardsL1Action = {
 
 // src/actions/isL2BlockCheckpointed.ts
 import {
-  logger as logger13,
-  composePromptFromState as composePromptFromState12,
-  ModelType as ModelType12,
-  parseJSONObjectFromText as parseJSONObjectFromText9
+  logger as logger11,
+  composePromptFromState as composePromptFromState10,
+  ModelType as ModelType10,
+  parseJSONObjectFromText as parseJSONObjectFromText7
 } from "@elizaos/core";
 var isL2BlockCheckpointedAction = {
   name: "IS_L2_BLOCK_CHECKPOINTED",
   description: "Checks if a Polygon L2 block has been checkpointed on Ethereum L1.",
   validate: async (runtime, _message, _state) => {
-    logger13.debug("Validating IS_L2_BLOCK_CHECKPOINTED action...");
+    logger11.debug("Validating IS_L2_BLOCK_CHECKPOINTED action...");
     const requiredSettings = [
       "PRIVATE_KEY",
       "ETHEREUM_RPC_URL",
@@ -6667,7 +6028,7 @@ var isL2BlockCheckpointedAction = {
     ];
     for (const setting of requiredSettings) {
       if (!runtime.getSetting(setting)) {
-        logger13.error(
+        logger11.error(
           `Required setting ${setting} not configured for IS_L2_BLOCK_CHECKPOINTED action.`
         );
         return false;
@@ -6676,37 +6037,37 @@ var isL2BlockCheckpointedAction = {
     try {
       const service = runtime.getService(PolygonRpcService.serviceType);
       if (!service) {
-        logger13.error("PolygonRpcService not initialized.");
+        logger11.error("PolygonRpcService not initialized.");
         return false;
       }
     } catch (error) {
-      logger13.error("Error accessing PolygonRpcService during validation:", error);
+      logger11.error("Error accessing PolygonRpcService during validation:", error);
       return false;
     }
     return true;
   },
   handler: async (runtime, message, state, _options, callback, _responses) => {
-    logger13.info("Handling IS_L2_BLOCK_CHECKPOINTED action for message:", message.id);
+    logger11.info("Handling IS_L2_BLOCK_CHECKPOINTED action for message:", message.id);
     try {
       const rpcService = runtime.getService(PolygonRpcService.serviceType);
       if (!rpcService) throw new Error("PolygonRpcService not available");
-      const prompt = composePromptFromState12({
+      const prompt = composePromptFromState10({
         state: state ? state : { values: {}, data: {}, text: "" },
         template: isL2BlockCheckpointedTemplate
       });
-      const modelResponse = await runtime.useModel(ModelType12.TEXT_SMALL, {
+      const modelResponse = await runtime.useModel(ModelType10.TEXT_SMALL, {
         prompt
       });
       let params;
       try {
-        params = parseJSONObjectFromText9(modelResponse);
-        logger13.debug("IS_L2_BLOCK_CHECKPOINTED: Extracted params:", params);
+        params = parseJSONObjectFromText7(modelResponse);
+        logger11.debug("IS_L2_BLOCK_CHECKPOINTED: Extracted params:", params);
         if (params.error) {
-          logger13.warn(`IS_L2_BLOCK_CHECKPOINTED: Model responded with error: ${params.error}`);
+          logger11.warn(`IS_L2_BLOCK_CHECKPOINTED: Model responded with error: ${params.error}`);
           throw new Error(params.error);
         }
       } catch (error) {
-        logger13.error(
+        logger11.error(
           "Failed to parse LLM response for checkpoint parameters:",
           modelResponse,
           error
@@ -6717,12 +6078,12 @@ var isL2BlockCheckpointedAction = {
         throw new Error("L2 block number parameter not extracted properly.");
       }
       const l2BlockNumber = BigInt(params.l2BlockNumber);
-      logger13.info(`Action: Checking checkpoint status for L2 block ${l2BlockNumber}`);
+      logger11.info(`Action: Checking checkpoint status for L2 block ${l2BlockNumber}`);
       const lastCheckpointedBlock = await rpcService.getLastCheckpointedL2Block();
       const isCheckpointed = await rpcService.isL2BlockCheckpointed(l2BlockNumber);
       const currentL2Block = await rpcService.getCurrentBlockNumber();
       const responseMsg = `Block ${l2BlockNumber} ${isCheckpointed ? "is" : "is not"} checkpointed on Ethereum L1. Last checkpointed block: ${lastCheckpointedBlock}`;
-      logger13.info(responseMsg);
+      logger11.info(responseMsg);
       const responseContent = {
         text: responseMsg,
         actions: ["IS_L2_BLOCK_CHECKPOINTED"],
@@ -6740,7 +6101,7 @@ var isL2BlockCheckpointedAction = {
       return responseContent;
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error);
-      logger13.error("Failed to check if block is checkpointed:", error);
+      logger11.error("Failed to check if block is checkpointed:", error);
       const userFriendlyMessage = `Unable to verify checkpoint status. The CheckpointManager contract on Ethereum L1 encountered an error: ${errorMessage}. This could be due to a network issue or a contract configuration problem.`;
       const responseContent = {
         text: userFriendlyMessage,
@@ -6776,971 +6137,306 @@ var isL2BlockCheckpointedAction = {
   ]
 };
 
-// src/actions/heimdallVoteAction.ts
-import {
-  logger as logger15,
-  composePromptFromState as composePromptFromState13,
-  ModelType as ModelType13,
-  parseJSONObjectFromText as parseJSONObjectFromText10
-} from "@elizaos/core";
-
-// src/services/HeimdallService.ts
-import { coins, DirectSecp256k1Wallet } from "@cosmjs/proto-signing";
-import { SigningStargateClient as ConcreteSigningStargateClient } from "@cosmjs/stargate";
-import { Service as Service2, logger as logger14 } from "@elizaos/core";
-var HEIMDALL_RPC_URL_KEY = "HEIMDALL_RPC_URL";
-var PRIVATE_KEY_KEY = "PRIVATE_KEY";
-var VoteOption = /* @__PURE__ */ ((VoteOption2) => {
-  VoteOption2[VoteOption2["VOTE_OPTION_UNSPECIFIED"] = 0] = "VOTE_OPTION_UNSPECIFIED";
-  VoteOption2[VoteOption2["VOTE_OPTION_YES"] = 1] = "VOTE_OPTION_YES";
-  VoteOption2[VoteOption2["VOTE_OPTION_ABSTAIN"] = 2] = "VOTE_OPTION_ABSTAIN";
-  VoteOption2[VoteOption2["VOTE_OPTION_NO"] = 3] = "VOTE_OPTION_NO";
-  VoteOption2[VoteOption2["VOTE_OPTION_NO_WITH_VETO"] = 4] = "VOTE_OPTION_NO_WITH_VETO";
-  return VoteOption2;
-})(VoteOption || {});
-var _HeimdallService = class _HeimdallService extends Service2 {
-  constructor() {
-    super(...arguments);
-    this.capabilityDescription = "Provides access to Polygon Heimdall layer for governance operations.";
-    this.heimdallRpcUrl = null;
-    this.privateKey = null;
-  }
-  // initializeHeimdallClient will be called by the static start method
-  async initializeHeimdallClient() {
-    if (!this.runtime) {
-      logger14.error("Agent runtime is not available for HeimdallService.");
-      throw new Error("Agent runtime not available.");
-    }
-    this.heimdallRpcUrl = this.runtime.getSetting(HEIMDALL_RPC_URL_KEY);
-    this.privateKey = this.runtime.getSetting(PRIVATE_KEY_KEY);
-    if (!this.heimdallRpcUrl) {
-      logger14.error(`Heimdall RPC URL setting (${HEIMDALL_RPC_URL_KEY}) not found.`);
-      throw new Error("Heimdall RPC URL is not configured.");
-    }
-    if (!this.privateKey) {
-      logger14.error(`Heimdall private key setting (${PRIVATE_KEY_KEY}) not found.`);
-      throw new Error("Heimdall private key is not configured.");
-    }
-    logger14.info("HeimdallService initialized with necessary configurations.");
-  }
-  static async start(runtime) {
-    logger14.info("Starting HeimdallService...");
-    const service = new _HeimdallService(runtime);
-    await service.initializeHeimdallClient();
-    return service;
-  }
-  static async stop(runtime) {
-    logger14.info("Stopping HeimdallService...");
-    const service = runtime.getService(_HeimdallService.serviceType);
-    if (service) {
-      await service.stop();
-    }
-  }
-  async stop() {
-    logger14.info("HeimdallService instance stopped.");
-    this.heimdallRpcUrl = null;
-    this.privateKey = null;
-  }
-  async getSigner() {
-    if (!this.privateKey) {
-      logger14.error("Heimdall private key is not available in getSigner.");
-      throw new Error("Heimdall private key is not configured for HeimdallService.");
-    }
-    try {
-      const hexKey = this.privateKey.startsWith("0x") ? this.privateKey.substring(2) : this.privateKey;
-      if (!/^[0-9a-fA-F]{64}$/.test(hexKey)) {
-        logger14.error("Invalid private key format. Expected 64 hex characters.");
-        throw new Error("Invalid private key format.");
-      }
-      const privateKeyBytes = Uint8Array.from(Buffer.from(hexKey, "hex"));
-      const signer = await DirectSecp256k1Wallet.fromKey(privateKeyBytes, "heimdall");
-      return signer;
-    } catch (error) {
-      logger14.error(
-        "Failed to create Heimdall signer from private key.",
-        error instanceof Error ? error.message : String(error)
-      );
-      throw new Error("Failed to create Heimdall signer.");
-    }
-  }
-  async getSigningClient() {
-    if (!this.heimdallRpcUrl) {
-      logger14.error("Heimdall RPC URL is not available in getSigningClient.");
-      throw new Error("Heimdall RPC URL is not configured for HeimdallService.");
-    }
-    try {
-      const signer = await this.getSigner();
-      const options = {};
-      const client = await ConcreteSigningStargateClient.connectWithSigner(
-        this.heimdallRpcUrl,
-        signer,
-        options
-      );
-      logger14.debug("Successfully connected to Heimdall RPC with signer.");
-      return client;
-    } catch (error) {
-      logger14.error(
-        "Failed to connect to Heimdall RPC with signer.",
-        error instanceof Error ? error.message : String(error)
-      );
-      throw new Error("Failed to connect to Heimdall RPC with signer.");
-    }
-  }
-  /**
-   * Asserts that a transaction was successful by checking its code.
-   * @param result The broadcast tx result to check
-   * @throws Error if the transaction failed
-   */
-  assertIsBroadcastTxSuccess(result) {
-    if ("code" in result && result.code !== 0) {
-      const message = result.rawLog || "Transaction failed";
-      throw new Error(`Error when broadcasting tx: ${message}`);
-    }
-  }
-  /**
-   * Vote on a Heimdall governance proposal.
-   *
-   * @param proposalId The ID of the proposal to vote on
-   * @param option The vote option (YES, NO, etc.)
-   * @returns The transaction hash if successful
-   */
-  async voteOnProposal(proposalId, option) {
-    logger14.info(`Attempting to vote on proposal ${proposalId} with option ${VoteOption[option]}`);
-    try {
-      const client = await this.getSigningClient();
-      const signer = await this.getSigner();
-      const accounts = await signer.getAccounts();
-      if (accounts.length === 0) {
-        throw new Error("No accounts found in wallet");
-      }
-      const voter = accounts[0].address;
-      logger14.debug(`Voter address: ${voter}`);
-      const msgVote = {
-        typeUrl: "/cosmos.gov.v1beta1.MsgVote",
-        value: {
-          proposalId: proposalId.toString(),
-          // Ensure proposalId is a string
-          voter,
-          option
-        }
-      };
-      const fee = {
-        amount: coins(_HeimdallService.DEFAULT_FEE_AMOUNT, _HeimdallService.DEFAULT_DENOM),
-        gas: _HeimdallService.DEFAULT_GAS_LIMIT
-      };
-      logger14.debug("Broadcasting vote transaction...");
-      const result = await client.signAndBroadcast(voter, [msgVote], fee);
-      this.assertIsBroadcastTxSuccess(result);
-      logger14.info(
-        `Successfully voted on proposal ${proposalId}, tx hash: ${result.transactionHash}`
-      );
-      return result.transactionHash;
-    } catch (error) {
-      let errorMessage;
-      if (error instanceof Error) {
-        errorMessage = error.message;
-        if (errorMessage.includes("insufficient fee")) {
-          errorMessage = "Insufficient fee for Heimdall transaction. Try increasing the fee amount.";
-        } else if (errorMessage.includes("proposal not found") || errorMessage.includes("not found")) {
-          errorMessage = `Proposal ${proposalId} not found or no longer in voting period.`;
-        } else if (errorMessage.includes("already voted")) {
-          errorMessage = `This account has already voted on proposal ${proposalId}.`;
-        }
-      } else {
-        errorMessage = String(error);
-      }
-      logger14.error(`Failed to vote on proposal ${proposalId}:`, errorMessage);
-      throw new Error(`Vote failed: ${errorMessage}`);
-    }
-  }
-  async submitProposal(content, initialDepositAmount, initialDepositDenom = "matic") {
-    const contentType = "changes" in content ? "ParameterChangeProposal" : "TextProposal";
-    logger14.info(`Attempting to submit ${contentType}`);
-    try {
-      const client = await this.getSigningClient();
-      const signer = await this.getSigner();
-      const accounts = await signer.getAccounts();
-      if (accounts.length === 0) {
-        throw new Error("No accounts found in wallet");
-      }
-      const proposer = accounts[0].address;
-      logger14.debug(`Proposal from address: ${proposer}`);
-      let typeUrl;
-      if ("changes" in content) {
-        typeUrl = "/cosmos.params.v1beta1.ParameterChangeProposal";
-        logger14.debug(`Parameter change proposal: ${content.title}`);
-      } else {
-        typeUrl = "/cosmos.gov.v1beta1.TextProposal";
-        logger14.debug(`Text proposal: ${content.title}`);
-      }
-      const msgSubmitProposal = {
-        typeUrl: "/cosmos.gov.v1beta1.MsgSubmitProposal",
-        value: {
-          content: {
-            typeUrl,
-            value: content
-            // When using cosmjs, this will get properly converted/encoded
-          },
-          initialDeposit: coins(initialDepositAmount, initialDepositDenom),
-          proposer
-        }
-      };
-      const fee = {
-        amount: coins(_HeimdallService.DEFAULT_FEE_AMOUNT, _HeimdallService.DEFAULT_DENOM),
-        gas: _HeimdallService.DEFAULT_GAS_LIMIT
-      };
-      logger14.debug("Broadcasting submit proposal transaction...");
-      const result = await client.signAndBroadcast(proposer, [msgSubmitProposal], fee);
-      this.assertIsBroadcastTxSuccess(result);
-      logger14.info(`Successfully submitted proposal, tx hash: ${result.transactionHash}`);
-      return result.transactionHash;
-    } catch (error) {
-      let errorMessage;
-      if (error instanceof Error) {
-        errorMessage = error.message;
-        if (errorMessage.includes("insufficient fee")) {
-          errorMessage = "Insufficient fee for Heimdall transaction. Try increasing the fee amount.";
-        } else if (errorMessage.includes("minimum deposit")) {
-          errorMessage = "The initial deposit is below the minimum required for proposals.";
-        }
-      } else {
-        errorMessage = String(error);
-      }
-      logger14.error("Failed to submit proposal:", errorMessage);
-      throw new Error(`Proposal submission failed: ${errorMessage}`);
-    }
-  }
-  async transferHeimdallTokens(recipientAddress, amount, denom = "matic") {
-    logger14.info(`Attempting to transfer ${amount} ${denom} to ${recipientAddress} on Heimdall`);
-    try {
-      const client = await this.getSigningClient();
-      const signer = await this.getSigner();
-      const accounts = await signer.getAccounts();
-      if (accounts.length === 0) {
-        throw new Error("No accounts found in wallet");
-      }
-      const sender = accounts[0].address;
-      logger14.debug(`Sender address: ${sender}`);
-      if (!recipientAddress.startsWith("heimdall")) {
-        throw new Error(
-          `Invalid recipient address format: ${recipientAddress}. Must start with "heimdall"`
-        );
-      }
-      const msgSend = {
-        typeUrl: "/cosmos.bank.v1beta1.MsgSend",
-        value: {
-          fromAddress: sender,
-          toAddress: recipientAddress,
-          amount: coins(amount, denom)
-        }
-      };
-      const fee = {
-        amount: coins(_HeimdallService.DEFAULT_FEE_AMOUNT, _HeimdallService.DEFAULT_DENOM),
-        gas: _HeimdallService.DEFAULT_GAS_LIMIT
-      };
-      logger14.debug(`Broadcasting transfer transaction to ${recipientAddress}...`);
-      const result = await client.signAndBroadcast(sender, [msgSend], fee);
-      this.assertIsBroadcastTxSuccess(result);
-      logger14.info(
-        `Successfully transferred ${amount} ${denom} to ${recipientAddress}, tx hash: ${result.transactionHash}`
-      );
-      return result.transactionHash;
-    } catch (error) {
-      let errorMessage;
-      if (error instanceof Error) {
-        errorMessage = error.message;
-        if (errorMessage.includes("insufficient fee")) {
-          errorMessage = "Insufficient fee for Heimdall transaction. Try increasing the fee amount.";
-        } else if (errorMessage.includes("insufficient funds")) {
-          errorMessage = `Insufficient funds to transfer ${amount} ${denom}. Check your balance on Heimdall.`;
-        }
-      } else {
-        errorMessage = String(error);
-      }
-      logger14.error(`Failed to transfer tokens to ${recipientAddress}:`, errorMessage);
-      throw new Error(`Transfer failed: ${errorMessage}`);
-    }
-  }
-};
-_HeimdallService.serviceType = "heimdall";
-// Fee defaults for Heimdall transactions in MATIC - can be made configurable if needed
-_HeimdallService.DEFAULT_GAS_LIMIT = "200000";
-_HeimdallService.DEFAULT_FEE_AMOUNT = "5000000000000000";
-// 0.005 MATIC
-_HeimdallService.DEFAULT_DENOM = "matic";
-var HeimdallService = _HeimdallService;
-
-// src/actions/heimdallVoteAction.ts
+// src/actions/heimdallValidatorInfoAction.ts
+import { logger as logger12 } from "@elizaos/core";
 import { z } from "zod";
-var heimdallVoteParamsSchema = z.object({
-  proposalId: z.union([z.string(), z.number()]).describe("The ID of the Heimdall governance proposal to vote on."),
-  option: z.nativeEnum(VoteOption).describe(
-    "The vote option (e.g., VOTE_OPTION_YES, VOTE_OPTION_NO). Provide the numeric value or the string key."
-  )
+var validatorInfoSchema = z.object({
+  validatorId: z.string().describe("The validator ID to query information for")
 });
-function extractHeimdallVoteParamsFromText(text) {
-  const params = {};
-  logger15.debug(`Attempting to extract HeimdallVoteParams from text: "${text}".`);
-  const proposalIdMatch = text.match(/\b(?:proposal\s*id|prop\s*id)\s*[:\-]?\s*([\w\d\-]+)/i);
-  if (proposalIdMatch?.[1]) {
-    const id = proposalIdMatch[1];
-    params.proposalId = /^\d+$/.test(id) ? Number(id) : id;
-  }
-  const optionMatch = text.match(
-    /\b(?:vote|option|support)\s*[:\-]?\s*(yes|no with veto|no|abstain|unspecified|1|2|3|4|0)/i
-  );
-  if (optionMatch?.[1]) {
-    const optionStr = optionMatch[1].toLowerCase();
-    if (optionStr === "yes" || optionStr === "1") params.option = 1 /* VOTE_OPTION_YES */;
-    else if (optionStr === "no" || optionStr === "3") params.option = 3 /* VOTE_OPTION_NO */;
-    else if (optionStr === "abstain" || optionStr === "2")
-      params.option = 2 /* VOTE_OPTION_ABSTAIN */;
-    else if (optionStr === "no with veto" || optionStr === "4")
-      params.option = 4 /* VOTE_OPTION_NO_WITH_VETO */;
-    else if (optionStr === "unspecified" || optionStr === "0")
-      params.option = 0 /* VOTE_OPTION_UNSPECIFIED */;
-  }
-  logger15.debug("Manually extracted HeimdallVoteParams:", params);
-  return params;
-}
-var heimdallVoteAction = {
-  name: "HEIMDALL_VOTE_ON_PROPOSAL",
-  similes: ["VOTE_HEIMDALL_PROPOSAL", "CAST_VOTE_ON_HEIMDALL", "HEIMDALL_GOVERNANCE_VOTE"],
-  description: "Casts a vote on a Heimdall governance proposal.",
-  validate: async (runtime) => {
-    logger15.debug("Validating HEIMDALL_VOTE_ON_PROPOSAL action...");
-    const heimdallRpcUrl = runtime.getSetting("HEIMDALL_RPC_URL");
-    const privateKey = runtime.getSetting("PRIVATE_KEY");
-    if (!heimdallRpcUrl) {
-      logger15.error("HEIMDALL_RPC_URL is not configured for Heimdall actions.");
-      return false;
-    }
-    if (!privateKey) {
-      logger15.error("PRIVATE_KEY is not configured for Heimdall actions.");
-      return false;
-    }
-    logger15.debug("HEIMDALL_VOTE_ON_PROPOSAL validation successful based on settings.");
-    return true;
-  },
-  handler: async (runtime, message, state, _options, callback) => {
-    logger15.info(`Handling HEIMDALL_VOTE_ON_PROPOSAL for message: ${message.id}`);
-    const rawMessageText = message.content.text || "";
-    let extractedParams = null;
-    try {
-      const heimdallService = runtime.getService(HeimdallService.serviceType);
-      if (!heimdallService) {
-        throw new Error("HeimdallService is not available. Ensure it is registered and started.");
-      }
-      try {
-        const prompt = composePromptFromState13({
-          state,
-          template: heimdallVoteActionTemplate
-          // Assumes this template is defined
-        });
-        const modelResponse = await runtime.useModel(ModelType13.TEXT_SMALL, {
-          prompt
-        });
-        const parsed = parseJSONObjectFromText10(modelResponse);
-        if (parsed) {
-          extractedParams = parsed;
-          if (extractedParams && extractedParams.option !== void 0) {
-            const opt = String(extractedParams.option).toUpperCase().trim();
-            if (opt === "YES" || opt === "1") {
-              extractedParams.option = 1 /* VOTE_OPTION_YES */;
-            } else if (opt === "NO" || opt === "3") {
-              extractedParams.option = 3 /* VOTE_OPTION_NO */;
-            } else if (opt === "ABSTAIN" || opt === "2") {
-              extractedParams.option = 2 /* VOTE_OPTION_ABSTAIN */;
-            } else if (opt === "NO_WITH_VETO" || opt === "NOWITHVETO" || opt === "NO WITH VETO" || opt === "4") {
-              extractedParams.option = 4 /* VOTE_OPTION_NO_WITH_VETO */;
-            } else if (opt === "UNSPECIFIED" || opt === "0") {
-              extractedParams.option = 0 /* VOTE_OPTION_UNSPECIFIED */;
-            } else {
-              const numOpt = Number.parseInt(opt, 10);
-              if (!isNaN(numOpt) && VoteOption[numOpt] !== void 0) {
-                extractedParams.option = numOpt;
-              } else {
-                logger15.warn(
-                  `Unrecognized vote option from LLM: ${extractedParams.option}. Validation will likely fail.`
-                );
-              }
-            }
-          }
-        }
-        logger15.debug(
-          "HEIMDALL_VOTE_ON_PROPOSAL: Extracted params via TEXT_SMALL:",
-          extractedParams
-        );
-        if (extractedParams?.error) {
-          throw new Error(extractedParams.error);
-        }
-      } catch (e) {
-        const errorMsg = e instanceof Error ? e.message : String(e);
-        logger15.warn(
-          `HEIMDALL_VOTE_ON_PROPOSAL: Failed to parse JSON from model response or model returned error (Proceeding to manual extraction): ${errorMsg}`
-        );
-      }
-      if (!extractedParams || extractedParams.error || !extractedParams.proposalId || extractedParams.option === void 0) {
-        logger15.info(
-          "HEIMDALL_VOTE_ON_PROPOSAL: Model extraction insufficient or failed, attempting manual parameter extraction."
-        );
-        const manualParams = extractHeimdallVoteParamsFromText(rawMessageText);
-        if (extractedParams && !extractedParams.error) {
-          extractedParams = { ...manualParams, ...extractedParams };
-        } else {
-          extractedParams = manualParams;
-        }
-        logger15.debug(
-          "HEIMDALL_VOTE_ON_PROPOSAL: Params after manual extraction attempt:",
-          extractedParams
-        );
-      }
-      const validatedParams = heimdallVoteParamsSchema.safeParse(extractedParams);
-      if (!validatedParams.success) {
-        logger15.error(
-          "HEIMDALL_VOTE_ON_PROPOSAL: Invalid parameters after all extraction attempts.",
-          validatedParams.error.flatten()
-        );
-        throw new Error(
-          `Invalid parameters: ${validatedParams.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join(", ")}`
-        );
-      }
-      const { proposalId, option } = validatedParams.data;
-      logger15.debug("Heimdall vote parameters for service:", {
-        proposalId,
-        option
-      });
-      const txHash = await heimdallService.voteOnProposal(proposalId, option);
-      const successMsg = `Successfully voted ${VoteOption[option]} on Heimdall proposal ${proposalId}. Transaction Hash: ${txHash}`;
-      logger15.info(successMsg);
-      if (callback) {
-        await callback({
-          text: successMsg,
-          content: {
-            success: true,
-            transactionHash: txHash,
-            proposalId,
-            voteOption: VoteOption[option]
-          },
-          actions: [heimdallVoteAction.name],
-          source: message.content.source
-        });
-      }
-      return {
-        success: true,
-        transactionHash: txHash,
-        proposalId,
-        voteOption: VoteOption[option]
-      };
-    } catch (error) {
-      const errMsg = error instanceof Error ? error.message : String(error);
-      logger15.error("Error in HEIMDALL_VOTE_ON_PROPOSAL handler:", errMsg, error);
-      if (callback) {
-        await callback({
-          text: `Error voting on Heimdall proposal: ${errMsg}`,
-          actions: [heimdallVoteAction.name],
-          source: message.content.source
-        });
-      }
-      return { success: false, error: errMsg };
-    }
-  },
-  examples: [
-    [
-      {
-        name: "User votes YES on Heimdall",
-        id: "heimdall-vote-ex1-user",
-        role: "user",
-        entityId: "user123",
-        roomId: "room456",
-        timestamp: (/* @__PURE__ */ new Date()).toISOString(),
-        actions: ["HEIMDALL_VOTE_ON_PROPOSAL"],
-        content: {
-          text: "Vote YES on Heimdall proposal 42.",
-          source: "user-input"
-        }
-      }
-    ],
-    [
-      {
-        name: "User votes NO on Heimdall",
-        id: "heimdall-vote-ex2-user",
-        role: "user",
-        entityId: "user123",
-        roomId: "room456",
-        timestamp: (/* @__PURE__ */ new Date()).toISOString(),
-        actions: ["HEIMDALL_VOTE_ON_PROPOSAL"],
-        content: {
-          text: "Cast a NO vote for Heimdall governance proposal ID 15.",
-          source: "user-input"
-        }
-      }
-    ],
-    [
-      {
-        name: "User votes ABSTAIN on Heimdall",
-        id: "heimdall-vote-ex3-user",
-        role: "user",
-        entityId: "user123",
-        roomId: "room456",
-        timestamp: (/* @__PURE__ */ new Date()).toISOString(),
-        actions: ["HEIMDALL_VOTE_ON_PROPOSAL"],
-        content: {
-          text: "On Heimdall, vote ABSTAIN for proposal 77 using option 2.",
-          source: "user-input"
-        }
-      }
-    ]
-  ]
-};
-
-// src/actions/heimdallSubmitProposalAction.ts
-import {
-  logger as logger16,
-  composePromptFromState as composePromptFromState14,
-  ModelType as ModelType14,
-  parseJSONObjectFromText as parseJSONObjectFromText11
-} from "@elizaos/core";
-import { z as z2 } from "zod";
-var paramChangeSchema = z2.object({
-  subspace: z2.string().min(1),
-  key: z2.string().min(1),
-  value: z2.string()
-  // Value can be empty string
-});
-var textProposalSchema = z2.object({
-  type: z2.literal("TextProposal"),
-  title: z2.string().min(1).describe("Title of the text proposal."),
-  description: z2.string().min(1).describe("Description of the text proposal.")
-});
-var parameterChangeProposalSchema = z2.object({
-  type: z2.literal("ParameterChangeProposal"),
-  title: z2.string().min(1).describe("Title of the parameter change proposal."),
-  description: z2.string().min(1).describe("Description of the parameter change proposal."),
-  changes: z2.array(paramChangeSchema).min(1).describe("Array of parameter changes.")
-});
-var proposalContentSchema = z2.discriminatedUnion("type", [
-  textProposalSchema,
-  parameterChangeProposalSchema
-]);
-var heimdallSubmitProposalParamsSchema = z2.object({
-  content: proposalContentSchema.describe(
-    "The content of the proposal (TextProposal or ParameterChangeProposal)."
-  ),
-  initialDepositAmount: z2.string().min(1).describe('The amount of the initial deposit for the proposal (e.g., "10000000").'),
-  initialDepositDenom: z2.string().optional().default("matic").describe('The denomination of the initial deposit (default: "matic").')
-});
-function extractHeimdallSubmitProposalParamsFromText(text) {
-  logger16.debug(`Attempting to extract HeimdallSubmitProposalParams from text: "${text}".`);
-  const params = {};
-  const depositAmountMatch = text.match(/deposit(?:Amount)?[:\\-]?\\s*(\\d+)/i);
-  if (depositAmountMatch?.[1]) params.initialDepositAmount = depositAmountMatch[1];
-  const depositDenomMatch = text.match(/depositDenom[:\\-]?\\s*(\\w+)/i);
-  if (depositDenomMatch?.[1]) params.initialDepositDenom = depositDenomMatch[1];
-  const partialContent = {};
-  const titleMatch = text.match(/title[:\\-]?\\s*([\"\'](.+?)[\"\']|([^,\\n{\\[]+))/i);
-  if (titleMatch?.[2] || titleMatch?.[3]) {
-    partialContent.title = (titleMatch[2] || titleMatch[3]).trim();
-  }
-  const descriptionMatch = text.match(/description[:\\-]?\\s*([\"\'](.+?)[\"\']|([^,\\n{\\[]+))/i);
-  if (descriptionMatch?.[2] || descriptionMatch?.[3]) {
-    partialContent.description = (descriptionMatch[2] || descriptionMatch[3]).trim();
-  }
-  if (text.toLowerCase().includes("parameterchange") || text.toLowerCase().includes("param change")) {
-    partialContent.type = "ParameterChangeProposal";
-  } else if (partialContent.title) {
-    partialContent.type = "TextProposal";
-  }
-  if (Object.keys(partialContent).length > 0) {
-    params.content = partialContent;
-  }
-  logger16.debug("Manually extracted HeimdallSubmitProposalParams (partial):", params);
-  return params;
-}
-var heimdallSubmitProposalAction = {
-  name: "HEIMDALL_SUBMIT_PROPOSAL",
+var heimdallValidatorInfoAction = {
+  name: "HEIMDALL_VALIDATOR_INFO",
   similes: [
-    "SUBMIT_HEIMDALL_PROPOSAL",
-    "CREATE_HEIMDALL_GOVERNANCE_PROPOSAL",
-    "HEIMDALL_NEW_PROPOSAL"
+    "GET_HEIMDALL_VALIDATOR_INFO",
+    "HEIMDALL_VALIDATOR_DETAILS",
+    "QUERY_VALIDATOR_INFO",
+    "VALIDATOR_INFO_HEIMDALL",
+    "CHECK_VALIDATOR_HEIMDALL"
   ],
-  description: "Submits a new governance proposal (Text or ParameterChange) to Heimdall.",
-  validate: async (runtime) => {
-    logger16.debug("Validating HEIMDALL_SUBMIT_PROPOSAL action...");
-    const heimdallRpcUrl = runtime.getSetting("HEIMDALL_RPC_URL");
-    const privateKey = runtime.getSetting("PRIVATE_KEY");
-    if (!heimdallRpcUrl) {
-      logger16.error("HEIMDALL_RPC_URL is not configured.");
-      return false;
-    }
-    if (!privateKey) {
-      logger16.error("PRIVATE_KEY is not configured.");
-      return false;
-    }
-    logger16.debug("HEIMDALL_SUBMIT_PROPOSAL validation successful.");
+  description: "Queries validator information from Heimdall network (read-only operation)",
+  validate: async (runtime, message) => {
+    logger12.log("Validating Heimdall validator info query...");
     return true;
   },
-  handler: async (runtime, message, state, _options, callback) => {
-    logger16.info(`Handling HEIMDALL_SUBMIT_PROPOSAL for message: ${message.id}`);
-    const rawMessageText = message.content.text || "";
-    let extractedParams = null;
+  handler: async (runtime, message, state, options, callback) => {
+    logger12.log("Executing Heimdall validator info query...");
     try {
-      const heimdallService = runtime.getService(HeimdallService.serviceType);
-      if (!heimdallService) {
-        throw new Error("HeimdallService is not available.");
+      const params = validatorInfoSchema.parse({
+        validatorId: options?.validatorId || extractValidatorId(message.content.text || "")
+      });
+      const heimdallUrl = runtime.getSetting("HEIMDALL_RPC_URL") || "https://heimdall-api.polygon.technology";
+      const response = await fetch(`${heimdallUrl}/staking/validator/${params.validatorId}`);
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
       }
-      try {
-        const prompt = composePromptFromState14({
-          state: state ?? { values: {}, data: {}, text: "" },
-          // Provide a default State object if state is undefined
-          template: heimdallSubmitProposalActionTemplate
-        });
-        const modelResponse = await runtime.useModel(ModelType14.TEXT_SMALL, {
-          prompt
-        });
-        logger16.debug(
-          "HEIMDALL_SUBMIT_PROPOSAL: Raw modelResponse from runtime.useModel:",
-          modelResponse
-        );
-        let jsonString = modelResponse;
-        const regex = /```(?:json)?\s*([\s\S]*?)\s*```/;
-        logger16.debug("HEIMDALL_SUBMIT_PROPOSAL: Regex to be used for stripping:", regex.toString());
-        const match = modelResponse.match(regex);
-        logger16.debug("HEIMDALL_SUBMIT_PROPOSAL: Result of modelResponse.match(regex):", match);
-        if (match && match[1]) {
-          logger16.debug("HEIMDALL_SUBMIT_PROPOSAL: Regex match found. match[1] is:", match[1]);
-          jsonString = match[1];
-          jsonString = jsonString.replace(/\/\/.*$/gm, "");
-          logger16.debug(
-            "HEIMDALL_SUBMIT_PROPOSAL: jsonString after stripping attempt and comment removal:",
-            jsonString
-          );
-        } else {
-          logger16.warn(
-            "HEIMDALL_SUBMIT_PROPOSAL: Regex did not match or match[1] was empty. jsonString remains unstripped."
-          );
-        }
-        logger16.debug(
-          "Model's json response (this is jsonString passed to parseJSONObjectFromText):",
-          jsonString
-        );
-        let directParseResult = null;
-        let directParseError = null;
-        try {
-          directParseResult = JSON.parse(jsonString);
-          logger16.debug(
-            "HEIMDALL_SUBMIT_PROPOSAL: Direct JSON.parse(jsonString) SUCCEEDED. Result:",
-            directParseResult
-          );
-        } catch (e) {
-          directParseError = e instanceof Error ? e.message : String(e);
-          logger16.error(
-            "HEIMDALL_SUBMIT_PROPOSAL: Direct JSON.parse(jsonString) FAILED. Error:",
-            directParseError
-          );
-          logger16.error(
-            "HEIMDALL_SUBMIT_PROPOSAL: jsonString that failed direct parse was:",
-            jsonString
-          );
-        }
-        const parsed = directParseResult ?? parseJSONObjectFromText11(jsonString);
-        logger16.debug(
-          "HEIMDALL_SUBMIT_PROPOSAL: Result from parseJSONObjectFromText(jsonString) or directParseResult:",
-          parsed
-        );
-        if (parsed) {
-          extractedParams = parsed;
-        }
-        logger16.debug("HEIMDALL_SUBMIT_PROPOSAL: Extracted params via TEXT_SMALL:", extractedParams);
-        if (extractedParams?.error) {
-          throw new Error(extractedParams.error);
-        }
-      } catch (e) {
-        const errorMsg = e instanceof Error ? e.message : String(e);
-        logger16.warn(
-          `HEIMDALL_SUBMIT_PROPOSAL: Failed to parse JSON from model (Proceeding to manual): ${errorMsg}`
-        );
-      }
-      if (!extractedParams || extractedParams.error && extractedParams.error.trim() !== "" || !extractedParams.content || !extractedParams.initialDepositAmount) {
-        logger16.info(
-          "HEIMDALL_SUBMIT_PROPOSAL: Model extraction insufficient, attempting manual parameter extraction."
-        );
-        const manualParams = extractHeimdallSubmitProposalParamsFromText(rawMessageText);
-        if (extractedParams && !extractedParams.error) {
-          extractedParams = { ...manualParams, ...extractedParams };
-          if (manualParams.content && extractedParams.content) {
-            extractedParams.content = {
-              ...manualParams.content,
-              ...extractedParams.content
-            };
-          }
-        } else {
-          extractedParams = manualParams;
-        }
-        logger16.debug("HEIMDALL_SUBMIT_PROPOSAL: Params after manual extraction:", extractedParams);
-      }
-      const validatedParams = heimdallSubmitProposalParamsSchema.safeParse(extractedParams);
-      if (!validatedParams.success) {
-        logger16.error(
-          "HEIMDALL_SUBMIT_PROPOSAL: Invalid parameters.",
-          validatedParams.error.flatten()
-        );
-        throw new Error(
-          `Invalid parameters: ${validatedParams.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join(", ")}`
-        );
-      }
-      const { content, initialDepositAmount, initialDepositDenom } = validatedParams.data;
-      const { type, ...actualContent } = content;
-      const txHash = await heimdallService.submitProposal(
-        actualContent,
-        // Cast to service-level types
-        initialDepositAmount,
-        initialDepositDenom
-      );
-      const successMsg = `Successfully submitted Heimdall proposal. Type: ${type}, Title: ${actualContent.title}. Tx Hash: ${txHash}`;
-      logger16.info(successMsg);
-      if (callback) {
-        await callback({
-          text: successMsg,
-          content: {
-            success: true,
-            transactionHash: txHash,
-            proposalType: type,
-            title: actualContent.title
-          },
-          actions: [heimdallSubmitProposalAction.name],
-          source: message.content.source
-        });
-      }
-      return {
+      const validatorData = await response.json();
+      const result = {
         success: true,
-        transactionHash: txHash,
-        proposalType: type,
-        title: actualContent.title
+        validatorId: params.validatorId,
+        data: validatorData,
+        message: `Successfully retrieved validator ${params.validatorId} information`
       };
-    } catch (error) {
-      const errMsg = error instanceof Error ? error.message : String(error);
-      logger16.error("Error in HEIMDALL_SUBMIT_PROPOSAL handler:", errMsg, error);
       if (callback) {
-        await callback({
-          text: `Error submitting Heimdall proposal: ${errMsg}`,
-          actions: [heimdallSubmitProposalAction.name],
-          source: message.content.source
+        const validator = validatorData.result;
+        callback({
+          text: `**Heimdall Validator Info**
+
+**Validator ID:** ${params.validatorId}
+**Power:** ${validator?.power || "N/A"}
+**Jailed:** ${validator?.jailed ? "Yes" : "No"}
+**Signer Address:** ${validator?.signer || "N/A"}
+**Start Epoch:** ${validator?.startEpoch || "N/A"}
+**End Epoch:** ${validator?.endEpoch || "N/A"}
+**Last Updated:** ${validator?.last_updated || "N/A"}
+**Nonce:** ${validator?.nonce || "N/A"}
+
+Query successful`,
+          content: result
         });
       }
-      return { success: false, error: errMsg };
+      return result;
+    } catch (error) {
+      logger12.error("Error querying Heimdall validator info:", error);
+      const errorResult = {
+        success: false,
+        error: error instanceof Error ? error.message : "Unknown error occurred",
+        message: "Failed to query validator information from Heimdall"
+      };
+      if (callback) {
+        callback({
+          text: `**Heimdall Validator Query Failed**
+
+**Error:** ${errorResult.error}
+
+This could be due to:
+\u2022 Invalid validator ID
+\u2022 Network connectivity issues
+\u2022 Heimdall endpoint unavailable`,
+          content: errorResult
+        });
+      }
+      return errorResult;
     }
   },
   examples: [
     [
       {
-        name: "User submits Heimdall TextProposal",
-        id: "hsp-ex1-user",
-        role: "user",
-        entityId: "u1",
-        roomId: "r1",
-        timestamp: (/* @__PURE__ */ new Date()).toISOString(),
-        actions: ["HEIMDALL_SUBMIT_PROPOSAL"],
-        content: {
-          text: "Submit a Heimdall text proposal titled 'Network Upgrade Info' with description 'Details about upcoming v2 upgrade.' and deposit 10000000 matic.",
-          source: "user-input"
-        }
+        name: "user",
+        content: { text: "Get validator info for validator 1 on Heimdall" }
       }
     ],
     [
       {
-        name: "User submits Heimdall ParameterChangeProposal",
-        id: "hsp-ex2-user",
-        role: "user",
-        entityId: "u1",
-        roomId: "r1",
-        timestamp: (/* @__PURE__ */ new Date()).toISOString(),
-        actions: ["HEIMDALL_SUBMIT_PROPOSAL"],
-        content: {
-          text: "Propose a parameter change on Heimdall. Title: 'Update Staking Param', Description: 'Increase max validators'. Change subspace 'staking', key 'MaxValidators', value '120'. Initial deposit: 5000000 matic.",
-          source: "user-input"
-        }
+        name: "user",
+        content: { text: "Show me details for Heimdall validator 42" }
+      }
+    ]
+  ]
+};
+function extractValidatorId(text) {
+  const patterns = [
+    /validator\s+(\d+)/i,
+    // "validator 42"
+    /validator\s+ID\s+(\d+)/i,
+    // "validator ID 42"
+    /ID\s+(\d+)/i,
+    // "ID 42"
+    /\b(\d+)\b/
+    // any standalone number (fallback)
+  ];
+  for (const pattern of patterns) {
+    const matches = text.match(pattern);
+    if (matches && matches[1]) {
+      return matches[1];
+    }
+  }
+  return "1";
+}
+
+// src/actions/heimdallValidatorSetAction.ts
+import { logger as logger13 } from "@elizaos/core";
+var heimdallValidatorSetAction = {
+  name: "HEIMDALL_VALIDATOR_SET",
+  similes: [
+    "GET_HEIMDALL_VALIDATOR_SET",
+    "HEIMDALL_VALIDATORS",
+    "QUERY_VALIDATOR_SET",
+    "VALIDATOR_SET_HEIMDALL",
+    "LIST_HEIMDALL_VALIDATORS"
+  ],
+  description: "Queries the current validator set from Heimdall network (read-only operation)",
+  validate: async (runtime, message) => {
+    logger13.log("Validating Heimdall validator set query...");
+    return true;
+  },
+  handler: async (runtime, message, state, options, callback) => {
+    logger13.log("Executing Heimdall validator set query...");
+    try {
+      const heimdallUrl = runtime.getSetting("HEIMDALL_RPC_URL") || "https://heimdall-api.polygon.technology";
+      const response = await fetch(`${heimdallUrl}/staking/validator-set`);
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+      }
+      const validatorSetData = await response.json();
+      const validators = validatorSetData.result?.validators || [];
+      const result = {
+        success: true,
+        validatorCount: validators.length,
+        data: validatorSetData,
+        message: `Successfully retrieved validator set with ${validators.length} validators`
+      };
+      const validatorSummary = validators.slice(0, 10).map(
+        (validator, index) => `${index + 1}. **Validator ${validator.ID || "N/A"}**
+   \u2022 Power: ${validator.power || "N/A"}
+   \u2022 Jailed: ${validator.jailed ? "Yes" : "No"}
+   \u2022 Address: ${validator.signer || "N/A"}`
+      ).join("\n\n");
+      const displayText = validators.length > 10 ? `${validatorSummary}
+
+... and ${validators.length - 10} more validators` : validatorSummary;
+      if (callback) {
+        callback({
+          text: `**Heimdall Validator Set**
+
+**Total Validators:** ${validators.length}
+**Active Set:** ${validators.filter((v) => !v.jailed).length}
+**Jailed:** ${validators.filter((v) => v.jailed).length}
+
+**Top Validators:**
+
+${displayText}
+
+Query successful`,
+          content: result
+        });
+      }
+      return result;
+    } catch (error) {
+      logger13.error("Error querying Heimdall validator set:", error);
+      const errorResult = {
+        success: false,
+        error: error instanceof Error ? error.message : "Unknown error occurred",
+        message: "Failed to query validator set from Heimdall"
+      };
+      if (callback) {
+        callback({
+          text: `**Heimdall Validator Set Query Failed**
+
+**Error:** ${errorResult.error}
+
+This could be due to:
+\u2022 Network connectivity issues
+\u2022 Heimdall endpoint unavailable
+\u2022 API response format changes`,
+          content: errorResult
+        });
+      }
+      return errorResult;
+    }
+  },
+  examples: [
+    [
+      {
+        name: "user",
+        content: { text: "Show me the current Heimdall validator set" }
+      }
+    ],
+    [
+      {
+        name: "user",
+        content: { text: "List all validators on Heimdall network" }
+      }
+    ],
+    [
+      {
+        name: "user",
+        content: { text: "Get Heimdall validators" }
       }
     ]
   ]
 };
 
-// src/actions/heimdallTransferTokensAction.ts
-import {
-  logger as logger17,
-  composePromptFromState as composePromptFromState15,
-  ModelType as ModelType15,
-  parseJSONObjectFromText as parseJSONObjectFromText12
-} from "@elizaos/core";
-import { z as z3 } from "zod";
-var heimdallTransferTokensParamsSchema = z3.object({
-  recipientAddress: z3.string().startsWith(
-    "heimdallvaloper",
-    'Recipient address must start with "heimdallvaloper" for validators or "heimdall" for regular addresses.'
-  ).or(
-    z3.string().startsWith(
-      "heimdall",
-      'Recipient address must start with "heimdallvaloper" for validators or "heimdall" for regular addresses.'
-    )
-  ).describe(
-    'The Heimdall address of the recipient (must start with "heimdall" or "heimdallvaloper").'
-  ),
-  amount: z3.string().min(1).regex(/^\\d+$/, "Amount must be a string containing only digits (Wei).").describe('The amount of tokens to transfer in Wei (e.g., "1000000000000000000").'),
-  denom: z3.string().optional().default("matic").describe('The denomination of the tokens (default: "matic").')
-});
-function extractHeimdallTransferTokensParamsFromText(text) {
-  const params = {};
-  logger17.debug(`Attempting to extract HeimdallTransferTokensParams from text: "${text}".`);
-  const recipientMatch = text.match(
-    /\\b(?:to|recipient|receiver)\\s*[:\\-]?\\s*(heimdall(?:valoper)?[a-zA-Z0-9]+)/i
-  );
-  if (recipientMatch?.[1]) params.recipientAddress = recipientMatch[1];
-  const amountMatch = text.match(/\\b(amount|sum)\\s*[:\\-]?\\s*(\\d+)/i);
-  if (amountMatch?.[2]) params.amount = amountMatch[2];
-  const denomMatch = text.match(/\\b(denom|denomination|currency)\\s*[:\\-]?\\s*(\\w+)/i);
-  if (denomMatch?.[2]) params.denom = denomMatch[2].toLowerCase();
-  logger17.debug("Manually extracted HeimdallTransferTokensParams:", params);
-  return params;
-}
-var heimdallTransferTokensAction = {
-  name: "HEIMDALL_TRANSFER_TOKENS",
-  similes: ["TRANSFER_HEIMDALL_MATIC", "SEND_HEIMDALL_TOKENS", "HEIMDALL_TOKEN_TRANSFER"],
-  description: "Transfers native tokens (e.g., MATIC) on the Heimdall network.",
-  validate: async (runtime) => {
-    logger17.debug("Validating HEIMDALL_TRANSFER_TOKENS action...");
-    const heimdallRpcUrl = runtime.getSetting("HEIMDALL_RPC_URL");
-    const privateKey = runtime.getSetting("PRIVATE_KEY");
-    if (!heimdallRpcUrl) {
-      logger17.error("HEIMDALL_RPC_URL is not configured.");
-      return false;
-    }
-    if (!privateKey) {
-      logger17.error("PRIVATE_KEY is not configured.");
-      return false;
-    }
-    logger17.debug("HEIMDALL_TRANSFER_TOKENS validation successful.");
+// src/actions/heimdallCheckpointStatusAction.ts
+import { logger as logger14 } from "@elizaos/core";
+var heimdallCheckpointStatusAction = {
+  name: "HEIMDALL_CHECKPOINT_STATUS",
+  similes: [
+    "GET_HEIMDALL_CHECKPOINT_STATUS",
+    "HEIMDALL_CHECKPOINT_LATEST",
+    "QUERY_CHECKPOINT_STATUS",
+    "CHECKPOINT_STATUS_HEIMDALL",
+    "CHECK_LATEST_CHECKPOINT"
+  ],
+  description: "Queries the latest checkpoint status from Heimdall network (read-only operation)",
+  validate: async (runtime, message) => {
+    logger14.log("Validating Heimdall checkpoint status query...");
     return true;
   },
-  handler: async (runtime, message, state, _options, callback) => {
-    logger17.info(`Handling HEIMDALL_TRANSFER_TOKENS for message: ${message.id}`);
-    const rawMessageText = message.content.text || "";
-    let extractedParams = null;
+  handler: async (runtime, message, state, options, callback) => {
+    logger14.log("Executing Heimdall checkpoint status query...");
     try {
-      const heimdallService = runtime.getService(HeimdallService.serviceType);
-      if (!heimdallService) {
-        throw new Error("HeimdallService is not available.");
+      const heimdallUrl = runtime.getSetting("HEIMDALL_RPC_URL") || "https://heimdall-api.polygon.technology";
+      const response = await fetch(`${heimdallUrl}/checkpoints/latest`);
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
       }
-      try {
-        const prompt = composePromptFromState15({
-          state,
-          template: heimdallTransferTokensActionTemplate
-        });
-        const modelResponse = await runtime.useModel(ModelType15.TEXT_SMALL, {
-          prompt
-        });
-        const parsed = parseJSONObjectFromText12(modelResponse);
-        if (parsed) {
-          extractedParams = parsed;
-        }
-        logger17.debug("HEIMDALL_TRANSFER_TOKENS: Extracted params via TEXT_SMALL:", extractedParams);
-        if (extractedParams?.error) {
-          throw new Error(extractedParams.error);
-        }
-      } catch (e) {
-        const errorMsg = e instanceof Error ? e.message : String(e);
-        logger17.warn(
-          `HEIMDALL_TRANSFER_TOKENS: Failed to parse JSON from model (Proceeding to manual): ${errorMsg}`
-        );
-      }
-      if (!extractedParams || extractedParams.error || !extractedParams.recipientAddress || !extractedParams.amount) {
-        logger17.info(
-          "HEIMDALL_TRANSFER_TOKENS: Model extraction insufficient, attempting manual extraction."
-        );
-        const manualParams = extractHeimdallTransferTokensParamsFromText(rawMessageText);
-        if (extractedParams && !extractedParams.error) {
-          extractedParams = { ...manualParams, ...extractedParams };
-        } else {
-          extractedParams = manualParams;
-        }
-        logger17.debug("HEIMDALL_TRANSFER_TOKENS: Params after manual extraction:", extractedParams);
-      }
-      const validatedParams = heimdallTransferTokensParamsSchema.safeParse(extractedParams);
-      if (!validatedParams.success) {
-        logger17.error(
-          "HEIMDALL_TRANSFER_TOKENS: Invalid parameters.",
-          validatedParams.error.flatten()
-        );
-        throw new Error(
-          `Invalid parameters: ${validatedParams.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join(", ")}`
-        );
-      }
-      const { recipientAddress, amount, denom } = validatedParams.data;
-      const txHash = await heimdallService.transferHeimdallTokens(recipientAddress, amount, denom);
-      const successMsg = `Successfully transferred ${amount} ${denom || "matic"} to ${recipientAddress} on Heimdall. Tx Hash: ${txHash}`;
-      logger17.info(successMsg);
-      if (callback) {
-        await callback({
-          text: successMsg,
-          content: {
-            success: true,
-            transactionHash: txHash,
-            recipientAddress,
-            amount,
-            denom
-          },
-          actions: [heimdallTransferTokensAction.name],
-          source: message.content.source
-        });
-      }
-      return {
+      const checkpointData = await response.json();
+      const result = {
         success: true,
-        transactionHash: txHash,
-        recipientAddress,
-        amount,
-        denom
+        data: checkpointData,
+        message: "Successfully retrieved latest checkpoint status"
       };
-    } catch (error) {
-      const errMsg = error instanceof Error ? error.message : String(error);
-      logger17.error("Error in HEIMDALL_TRANSFER_TOKENS handler:", errMsg, error);
       if (callback) {
-        await callback({
-          text: `Error transferring Heimdall tokens: ${errMsg}`,
-          actions: [heimdallTransferTokensAction.name],
-          source: message.content.source
+        const checkpoint = checkpointData.result;
+        callback({
+          text: `**Heimdall Latest Checkpoint**
+
+**Checkpoint ID:** ${checkpoint?.id || "N/A"}
+**Proposer:** ${checkpoint?.proposer || "N/A"}
+**Start Block:** ${checkpoint?.start_block || "N/A"}
+**End Block:** ${checkpoint?.end_block || "N/A"}
+**Root Hash:** ${checkpoint?.root_hash || "N/A"}
+**Bor Chain ID:** ${checkpoint?.bor_chain_id || "N/A"}
+**Timestamp:** ${checkpoint?.timestamp ? new Date(checkpoint.timestamp * 1e3).toLocaleString() : "N/A"}
+
+Query successful`,
+          content: result
         });
       }
-      return { success: false, error: errMsg };
+      return result;
+    } catch (error) {
+      logger14.error("Error querying Heimdall checkpoint status:", error);
+      const errorResult = {
+        success: false,
+        error: error instanceof Error ? error.message : "Unknown error occurred",
+        message: "Failed to query checkpoint status from Heimdall"
+      };
+      if (callback) {
+        callback({
+          text: `**Heimdall Checkpoint Query Failed**
+
+**Error:** ${errorResult.error}
+
+This could be due to:
+\u2022 Network connectivity issues
+\u2022 Heimdall endpoint unavailable
+\u2022 API structure changes`,
+          content: errorResult
+        });
+      }
+      return errorResult;
     }
   },
   examples: [
     [
       {
-        name: "User transfers Heimdall MATIC",
-        id: "htt-ex1-user",
-        role: "user",
-        entityId: "u1",
-        roomId: "r1",
-        timestamp: (/* @__PURE__ */ new Date()).toISOString(),
-        actions: ["HEIMDALL_TRANSFER_TOKENS"],
-        content: {
-          text: "Send 0.5 MATIC on Heimdall to heimdall1recipientaddress. The amount is 500000000000000000 in wei.",
-          source: "user-input"
-        }
+        name: "user",
+        content: { text: "Get the latest checkpoint status from Heimdall" }
       }
     ],
     [
       {
-        name: "User transfers Heimdall tokens with different denom",
-        id: "htt-ex2-user",
-        role: "user",
-        entityId: "u1",
-        roomId: "r1",
-        timestamp: (/* @__PURE__ */ new Date()).toISOString(),
-        actions: ["HEIMDALL_TRANSFER_TOKENS"],
-        content: {
-          text: "Transfer 100000 uatom on Heimdall to heimdallvaloper1validatoraddress.",
-          source: "user-input"
-        }
+        name: "user",
+        content: { text: "Show me the current Heimdall checkpoint info" }
       }
     ]
   ]
@@ -7748,7 +6444,7 @@ var heimdallTransferTokensAction = {
 
 // src/actions/getBalanceInfo.ts
 import {
-  logger as logger18
+  logger as logger15
 } from "@elizaos/core";
 import { ethers as ethers4 } from "ethers";
 var USDC_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174";
@@ -7759,7 +6455,7 @@ var getUSDCBalanceAction = {
   description: "Gets the USDC balance for the agent wallet on Polygon.",
   validate: async (runtime, message, state) => {
     const content = message.content?.text?.toLowerCase() || "";
-    logger18.info(`[getUSDCBalanceAction] VALIDATION CALLED - message: "${content}"`);
+    logger15.info(`[getUSDCBalanceAction] VALIDATION CALLED - message: "${content}"`);
     try {
       const usdcKeywords = [
         "usdc balance",
@@ -7773,20 +6469,20 @@ var getUSDCBalanceAction = {
         "how much usdc"
       ];
       const matches = usdcKeywords.some((keyword) => content.includes(keyword));
-      logger18.info(`[getUSDCBalanceAction] Validation result: ${matches}`);
+      logger15.info(`[getUSDCBalanceAction] Validation result: ${matches}`);
       const rpcService = runtime.getService(PolygonRpcService.serviceType);
       if (!rpcService) {
-        logger18.warn(`[getUSDCBalanceAction] PolygonRpcService not available - validation false`);
+        logger15.warn(`[getUSDCBalanceAction] PolygonRpcService not available - validation false`);
         return false;
       }
       return matches;
     } catch (error) {
-      logger18.error(`[getUSDCBalanceAction] Validation error:`, error);
+      logger15.error(`[getUSDCBalanceAction] Validation error:`, error);
       return false;
     }
   },
   handler: async (runtime, message, state, options, callback) => {
-    logger18.info("[getUSDCBalanceAction] Handler called!");
+    logger15.info("[getUSDCBalanceAction] Handler called!");
     const rpcService = runtime.getService(PolygonRpcService.serviceType);
     if (!rpcService) {
       throw new Error("PolygonRpcService not available");
@@ -7802,7 +6498,7 @@ var getUSDCBalanceAction = {
       if (!agentAddress) {
         throw new Error("Could not determine agent address from provider");
       }
-      logger18.info(`Getting USDC balance for address: ${agentAddress}`);
+      logger15.info(`Getting USDC balance for address: ${agentAddress}`);
       const balance = await rpcService.getErc20Balance(USDC_ADDRESS, agentAddress);
       const formattedBalance = ethers4.formatUnits(balance, 6);
       const responseContent = {
@@ -7822,7 +6518,7 @@ var getUSDCBalanceAction = {
       }
       return responseContent;
     } catch (error) {
-      logger18.error("Error getting USDC balance:", error);
+      logger15.error("Error getting USDC balance:", error);
       const errorMessage = error instanceof Error ? error.message : String(error);
       const errorContent = {
         text: `Error retrieving USDC balance: ${errorMessage}`,
@@ -7874,7 +6570,7 @@ var getWETHBalanceAction = {
   description: "Gets the WETH balance for the agent wallet on Polygon.",
   validate: async (runtime, message, state) => {
     const content = message.content?.text?.toLowerCase() || "";
-    logger18.info(`[getWETHBalanceAction] VALIDATION CALLED - message: "${content}"`);
+    logger15.info(`[getWETHBalanceAction] VALIDATION CALLED - message: "${content}"`);
     try {
       const wethKeywords = [
         "weth balance",
@@ -7890,20 +6586,20 @@ var getWETHBalanceAction = {
         "wrapped ethereum"
       ];
       const matches = wethKeywords.some((keyword) => content.includes(keyword));
-      logger18.info(`[getWETHBalanceAction] Validation result: ${matches}`);
+      logger15.info(`[getWETHBalanceAction] Validation result: ${matches}`);
       const rpcService = runtime.getService(PolygonRpcService.serviceType);
       if (!rpcService) {
-        logger18.warn(`[getWETHBalanceAction] PolygonRpcService not available - validation false`);
+        logger15.warn(`[getWETHBalanceAction] PolygonRpcService not available - validation false`);
         return false;
       }
       return matches;
     } catch (error) {
-      logger18.error(`[getWETHBalanceAction] Validation error:`, error);
+      logger15.error(`[getWETHBalanceAction] Validation error:`, error);
       return false;
     }
   },
   handler: async (runtime, message, state, options, callback) => {
-    logger18.info("[getWETHBalanceAction] Handler called!");
+    logger15.info("[getWETHBalanceAction] Handler called!");
     const rpcService = runtime.getService(PolygonRpcService.serviceType);
     if (!rpcService) {
       throw new Error("PolygonRpcService not available");
@@ -7919,7 +6615,7 @@ var getWETHBalanceAction = {
       if (!agentAddress) {
         throw new Error("Could not determine agent address from provider");
       }
-      logger18.info(`Getting WETH balance for address: ${agentAddress}`);
+      logger15.info(`Getting WETH balance for address: ${agentAddress}`);
       const balance = await rpcService.getErc20Balance(WETH_ADDRESS, agentAddress);
       const formattedBalance = ethers4.formatEther(balance);
       const responseContent = {
@@ -7939,7 +6635,7 @@ var getWETHBalanceAction = {
       }
       return responseContent;
     } catch (error) {
-      logger18.error("Error getting WETH balance:", error);
+      logger15.error("Error getting WETH balance:", error);
       const errorMessage = error instanceof Error ? error.message : String(error);
       const errorContent = {
         text: `Error retrieving WETH balance: ${errorMessage}`,
@@ -7987,8 +6683,8 @@ var getWETHBalanceAction = {
 };
 
 // src/actions/getBlockInfo.ts
-import { logger as logger19 } from "@elizaos/core";
-import { z as z4 } from "zod";
+import { logger as logger16 } from "@elizaos/core";
+import { z as z2 } from "zod";
 
 // src/utils/formatters.ts
 import { formatUnits as viemFormatUnits, parseUnits as viemParseUnits } from "viem";
@@ -8035,15 +6731,15 @@ var getBlockNumberAction = {
   },
   // Actual handler function that performs the operation
   handler: async (runtime, message, state) => {
-    logger19.info("Getting current Polygon block number");
+    logger16.info("Getting current Polygon block number");
     const rpcService = runtime.getService(PolygonRpcService.serviceType);
     if (!rpcService) {
-      logger19.error("PolygonRpcService not available");
+      logger16.error("PolygonRpcService not available");
       throw new Error("PolygonRpcService not available");
     }
-    logger19.info("Fetching the current block number from Polygon network...");
+    logger16.info("Fetching the current block number from Polygon network...");
     const blockNumber = await rpcService.getCurrentBlockNumber();
-    logger19.info(`Successfully retrieved current block number: ${blockNumber}`);
+    logger16.info(`Successfully retrieved current block number: ${blockNumber}`);
     return {
       text: `Current Polygon block number: ${blockNumber}`,
       actions: ["GET_L2_BLOCK_NUMBER"],
@@ -8051,20 +6747,20 @@ var getBlockNumberAction = {
     };
   }
 };
-var blockIdentifierSchema = z4.union([
-  z4.number().positive("Block number must be positive"),
-  z4.string().regex(/^0x[a-fA-F0-9]{64}$/, "Block hash must be a valid hex string")
+var blockIdentifierSchema = z2.union([
+  z2.number().positive("Block number must be positive"),
+  z2.string().regex(/^0x[a-fA-F0-9]{64}$/, "Block hash must be a valid hex string")
 ]);
-var blockOptionsSchema = z4.object({
-  blockNumber: z4.number().int().positive().optional(),
-  blockHash: z4.string().regex(/^0x[a-fA-F0-9]{64}$/).optional()
+var blockOptionsSchema = z2.object({
+  blockNumber: z2.number().int().positive().optional(),
+  blockHash: z2.string().regex(/^0x[a-fA-F0-9]{64}$/).optional()
 }).refine((data) => data.blockNumber !== void 0 || data.blockHash !== void 0, {
   message: "Either blockNumber or blockHash must be provided"
 });
 
 // src/actions/getPolygonBlockDetails.ts
 import {
-  logger as logger20
+  logger as logger17
 } from "@elizaos/core";
 var getPolygonBlockDetailsAction = {
   name: "GET_POLYGON_BLOCK_DETAILS",
@@ -8072,7 +6768,7 @@ var getPolygonBlockDetailsAction = {
   description: "Gets details for a specific Polygon block when a block number is mentioned.",
   validate: async (runtime, message, state) => {
     const content = message.content?.text?.toLowerCase() || "";
-    logger20.info(`[getPolygonBlockDetailsAction] VALIDATION CALLED - message: "${content}"`);
+    logger17.info(`[getPolygonBlockDetailsAction] VALIDATION CALLED - message: "${content}"`);
     try {
       const blockDetailsKeywords = [
         "block details",
@@ -8100,24 +6796,24 @@ var getPolygonBlockDetailsAction = {
       const matches = blockDetailsKeywords.some((keyword) => content.includes(keyword));
       const hasBlockNumber = /block\s+\d+|details.*\d+/.test(content);
       const result = matches || hasBlockNumber;
-      logger20.info(
+      logger17.info(
         `[getPolygonBlockDetailsAction] Validation result: ${result} (keywords: ${matches}, hasBlockNumber: ${hasBlockNumber})`
       );
       const rpcService = runtime.getService(PolygonRpcService.serviceType);
       if (!rpcService) {
-        logger20.warn(
+        logger17.warn(
           `[getPolygonBlockDetailsAction] PolygonRpcService not available - validation false`
         );
         return false;
       }
       return result;
     } catch (error) {
-      logger20.error(`[getPolygonBlockDetailsAction] Validation error:`, error);
+      logger17.error(`[getPolygonBlockDetailsAction] Validation error:`, error);
       return false;
     }
   },
   handler: async (runtime, message, state, options, callback) => {
-    logger20.info("[getPolygonBlockDetailsAction] Handler called!");
+    logger17.info("[getPolygonBlockDetailsAction] Handler called!");
     const rpcService = runtime.getService(PolygonRpcService.serviceType);
     if (!rpcService) {
       throw new Error("PolygonRpcService not available");
@@ -8143,12 +6839,12 @@ var getPolygonBlockDetailsAction = {
       }
       if (extractedBlockNumber) {
         blockNumber = parseInt(extractedBlockNumber);
-        logger20.info(`Extracted block number ${blockNumber} from message: "${content}"`);
+        logger17.info(`Extracted block number ${blockNumber} from message: "${content}"`);
       } else {
         blockNumber = await rpcService.getCurrentBlockNumber();
-        logger20.info(`No block number found in message, using current block: ${blockNumber}`);
+        logger17.info(`No block number found in message, using current block: ${blockNumber}`);
       }
-      logger20.info(`Getting details for Polygon block: ${blockNumber}`);
+      logger17.info(`Getting details for Polygon block: ${blockNumber}`);
       const blockDetails = await rpcService.getBlockDetails(blockNumber);
       if (!blockDetails) {
         const notFoundContent = {
@@ -8189,7 +6885,7 @@ var getPolygonBlockDetailsAction = {
       }
       return responseContent;
     } catch (error) {
-      logger20.error("Error getting Polygon block details:", error);
+      logger17.error("Error getting Polygon block details:", error);
       const errorMessage = error instanceof Error ? error.message : String(error);
       const errorContent = {
         text: `Error retrieving Polygon block details: ${errorMessage}`,
@@ -8236,16 +6932,181 @@ var getPolygonBlockDetailsAction = {
   ]
 };
 
+// src/services/HeimdallService.ts
+import { coins, DirectSecp256k1Wallet } from "@cosmjs/proto-signing";
+import { SigningStargateClient as ConcreteSigningStargateClient } from "@cosmjs/stargate";
+import { Service as Service2, logger as logger18 } from "@elizaos/core";
+var HEIMDALL_RPC_URL_KEY = "HEIMDALL_RPC_URL";
+var PRIVATE_KEY_KEY = "PRIVATE_KEY";
+var _HeimdallService = class _HeimdallService extends Service2 {
+  constructor() {
+    super(...arguments);
+    this.capabilityDescription = "Provides access to Polygon Heimdall layer for token transfer operations.";
+    this.heimdallRpcUrl = null;
+    this.privateKey = null;
+  }
+  // initializeHeimdallClient will be called by the static start method
+  async initializeHeimdallClient() {
+    if (!this.runtime) {
+      logger18.error("Agent runtime is not available for HeimdallService.");
+      throw new Error("Agent runtime not available.");
+    }
+    this.heimdallRpcUrl = this.runtime.getSetting(HEIMDALL_RPC_URL_KEY);
+    this.privateKey = this.runtime.getSetting(PRIVATE_KEY_KEY);
+    if (!this.heimdallRpcUrl) {
+      logger18.error(`Heimdall RPC URL setting (${HEIMDALL_RPC_URL_KEY}) not found.`);
+      throw new Error("Heimdall RPC URL is not configured.");
+    }
+    if (!this.privateKey) {
+      logger18.error(`Heimdall private key setting (${PRIVATE_KEY_KEY}) not found.`);
+      throw new Error("Heimdall private key is not configured.");
+    }
+    logger18.info("HeimdallService initialized with necessary configurations.");
+  }
+  static async start(runtime) {
+    logger18.info("Starting HeimdallService...");
+    const service = new _HeimdallService(runtime);
+    await service.initializeHeimdallClient();
+    return service;
+  }
+  static async stop(runtime) {
+    logger18.info("Stopping HeimdallService...");
+    const service = runtime.getService(_HeimdallService.serviceType);
+    if (service) {
+      await service.stop();
+    }
+  }
+  async stop() {
+    logger18.info("HeimdallService instance stopped.");
+    this.heimdallRpcUrl = null;
+    this.privateKey = null;
+  }
+  async getSigner() {
+    if (!this.privateKey) {
+      logger18.error("Heimdall private key is not available in getSigner.");
+      throw new Error("Heimdall private key is not configured for HeimdallService.");
+    }
+    try {
+      const hexKey = this.privateKey.startsWith("0x") ? this.privateKey.substring(2) : this.privateKey;
+      if (!/^[0-9a-fA-F]{64}$/.test(hexKey)) {
+        logger18.error("Invalid private key format. Expected 64 hex characters.");
+        throw new Error("Invalid private key format.");
+      }
+      const privateKeyBytes = Uint8Array.from(Buffer.from(hexKey, "hex"));
+      const signer = await DirectSecp256k1Wallet.fromKey(privateKeyBytes, "heimdall");
+      return signer;
+    } catch (error) {
+      logger18.error(
+        "Failed to create Heimdall signer from private key.",
+        error instanceof Error ? error.message : String(error)
+      );
+      throw new Error("Failed to create Heimdall signer.");
+    }
+  }
+  async getSigningClient() {
+    if (!this.heimdallRpcUrl) {
+      logger18.error("Heimdall RPC URL is not available in getSigningClient.");
+      throw new Error("Heimdall RPC URL is not configured for HeimdallService.");
+    }
+    try {
+      const signer = await this.getSigner();
+      const options = {};
+      const client = await ConcreteSigningStargateClient.connectWithSigner(
+        this.heimdallRpcUrl,
+        signer,
+        options
+      );
+      logger18.debug("Successfully connected to Heimdall RPC with signer.");
+      return client;
+    } catch (error) {
+      logger18.error(
+        "Failed to connect to Heimdall RPC with signer.",
+        error instanceof Error ? error.message : String(error)
+      );
+      throw new Error("Failed to connect to Heimdall RPC with signer.");
+    }
+  }
+  /**
+   * Asserts that a transaction was successful by checking its code.
+   * @param result The broadcast tx result to check
+   * @throws Error if the transaction failed
+   */
+  assertIsBroadcastTxSuccess(result) {
+    if ("code" in result && result.code !== 0) {
+      const message = result.rawLog || "Transaction failed";
+      throw new Error(`Error when broadcasting tx: ${message}`);
+    }
+  }
+  async transferHeimdallTokens(recipientAddress, amount, denom = "matic") {
+    logger18.info(`Attempting to transfer ${amount} ${denom} to ${recipientAddress} on Heimdall`);
+    try {
+      const client = await this.getSigningClient();
+      const signer = await this.getSigner();
+      const accounts = await signer.getAccounts();
+      if (accounts.length === 0) {
+        throw new Error("No accounts found in wallet");
+      }
+      const sender = accounts[0].address;
+      logger18.debug(`Sender address: ${sender}`);
+      if (!recipientAddress.startsWith("heimdall")) {
+        throw new Error(
+          `Invalid recipient address format: ${recipientAddress}. Must start with "heimdall"`
+        );
+      }
+      const msgSend = {
+        typeUrl: "/cosmos.bank.v1beta1.MsgSend",
+        value: {
+          fromAddress: sender,
+          toAddress: recipientAddress,
+          amount: coins(amount, denom)
+        }
+      };
+      const fee = {
+        amount: coins(_HeimdallService.DEFAULT_FEE_AMOUNT, _HeimdallService.DEFAULT_DENOM),
+        gas: _HeimdallService.DEFAULT_GAS_LIMIT
+      };
+      logger18.debug(`Broadcasting transfer transaction to ${recipientAddress}...`);
+      const result = await client.signAndBroadcast(sender, [msgSend], fee);
+      this.assertIsBroadcastTxSuccess(result);
+      logger18.info(
+        `Successfully transferred ${amount} ${denom} to ${recipientAddress}, tx hash: ${result.transactionHash}`
+      );
+      return result.transactionHash;
+    } catch (error) {
+      let errorMessage;
+      if (error instanceof Error) {
+        errorMessage = error.message;
+        if (errorMessage.includes("insufficient fee")) {
+          errorMessage = "Insufficient fee for Heimdall transaction. Try increasing the fee amount.";
+        } else if (errorMessage.includes("insufficient funds")) {
+          errorMessage = `Insufficient funds to transfer ${amount} ${denom}. Check your balance on Heimdall.`;
+        }
+      } else {
+        errorMessage = String(error);
+      }
+      logger18.error(`Failed to transfer tokens to ${recipientAddress}:`, errorMessage);
+      throw new Error(`Transfer failed: ${errorMessage}`);
+    }
+  }
+};
+_HeimdallService.serviceType = "heimdall";
+// Fee defaults for Heimdall transactions in MATIC - can be made configurable if needed
+_HeimdallService.DEFAULT_GAS_LIMIT = "200000";
+_HeimdallService.DEFAULT_FEE_AMOUNT = "5000000000000000";
+// 0.005 MATIC
+_HeimdallService.DEFAULT_DENOM = "matic";
+var HeimdallService = _HeimdallService;
+
 // src/index.ts
 process.on("unhandledRejection", (reason, promise) => {
-  logger21.error("Unhandled Promise Rejection:", reason);
+  logger19.error("Unhandled Promise Rejection:", reason);
 });
-var configSchema = z5.object({
-  POLYGON_RPC_URL: z5.string().url("Invalid Polygon RPC URL").min(1),
-  ETHEREUM_RPC_URL: z5.string().url("Invalid Ethereum RPC URL").min(1),
-  PRIVATE_KEY: z5.string().min(1, "Private key is required"),
-  POLYGONSCAN_KEY: z5.string().min(1, "PolygonScan API Key is required"),
-  HEIMDALL_RPC_URL: z5.string().url("Invalid Heimdall RPC URL").min(1).optional()
+var configSchema = z3.object({
+  POLYGON_RPC_URL: z3.string().url("Invalid Polygon RPC URL").min(1),
+  ETHEREUM_RPC_URL: z3.string().url("Invalid Ethereum RPC URL").min(1),
+  PRIVATE_KEY: z3.string().min(1, "Private key is required"),
+  POLYGONSCAN_KEY: z3.string().min(1, "PolygonScan API Key is required"),
+  HEIMDALL_RPC_URL: z3.string().url("Invalid Heimdall RPC URL").min(1).optional()
 });
 var polygonActions = [
   transferPolygonAction,
@@ -8253,8 +7114,6 @@ var polygonActions = [
   getDelegatorInfoAction,
   bridgeDepositAction,
   getCheckpointStatusAction,
-  proposeGovernanceAction,
-  voteGovernanceAction,
   getL2BlockNumberAction,
   getMaticBalanceAction,
   getPolygonGasEstimatesAction,
@@ -8263,22 +7122,22 @@ var polygonActions = [
   withdrawRewardsAction,
   restakeRewardsL1Action,
   isL2BlockCheckpointedAction,
-  heimdallVoteAction,
-  heimdallSubmitProposalAction,
-  heimdallTransferTokensAction,
   getBlockNumberAction,
   // getBlockDetailsAction,  // Temporarily disabled - uses old interface, conflicts with getPolygonBlockDetailsAction
   getPolygonBlockDetailsAction,
   getUSDCBalanceAction,
-  getWETHBalanceAction
+  getWETHBalanceAction,
+  heimdallValidatorInfoAction,
+  heimdallValidatorSetAction,
+  heimdallCheckpointStatusAction
 ];
-logger21.info(`[PolygonPlugin] Registering ${polygonActions.length} actions:`);
+logger19.info(`[PolygonPlugin] Registering ${polygonActions.length} actions:`);
 polygonActions.forEach((action) => {
-  logger21.info(
+  logger19.info(
     `[PolygonPlugin] - Action: ${action.name} (similes: ${action.similes?.join(", ") || "none"})`
   );
 });
-logger21.info(
+logger19.info(
   `[PolygonPlugin] Actions with new interface: GET_MATIC_BALANCE, GET_L2_BLOCK_NUMBER, GET_POLYGON_BLOCK_DETAILS, GET_USDC_BALANCE, GET_WETH_BALANCE`
 );
 var polygonProviderInfo = {
@@ -8339,7 +7198,7 @@ var polygonProviderInfo = {
         }
       };
     } catch (error) {
-      logger21.error("Error getting Polygon provider info:", error);
+      logger19.error("Error getting Polygon provider info:", error);
       const errorMessage = error instanceof Error ? error.message : String(error);
       const userMessage = errorMessage.includes("private key") ? "There was an issue with the wallet configuration. Please ensure PRIVATE_KEY is correctly set." : `Error getting Polygon provider info: ${errorMessage}`;
       return {
@@ -8365,25 +7224,25 @@ var polygonPlugin = {
   },
   // Initialization logic
   async init(config, runtime) {
-    logger21.info(`Initializing plugin: ${this.name}`);
+    logger19.info(`Initializing plugin: ${this.name}`);
     try {
       const validatedConfig = await configSchema.parseAsync(config);
-      logger21.info("Polygon plugin configuration validated successfully.");
+      logger19.info("Polygon plugin configuration validated successfully.");
       for (const [key, value] of Object.entries(validatedConfig)) {
         if (!runtime.getSetting(key)) {
-          logger21.warn(
+          logger19.warn(
             `Setting ${key} was validated but not found via runtime.getSetting. Ensure it is loaded globally before plugin init.`
           );
         }
       }
     } catch (error) {
-      if (error instanceof z5.ZodError) {
-        logger21.error("Invalid Polygon plugin configuration:", error.errors);
+      if (error instanceof z3.ZodError) {
+        logger19.error("Invalid Polygon plugin configuration:", error.errors);
         throw new Error(
           `Invalid Polygon plugin configuration: ${error.errors.map((e) => `${e.path.join(".")}: ${e.message}`).join("; ")}`
         );
       }
-      logger21.error("Error during Polygon plugin initialization:", error);
+      logger19.error("Error during Polygon plugin initialization:", error);
       throw error;
     }
   },
